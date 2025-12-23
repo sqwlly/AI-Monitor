@@ -1,6 +1,6 @@
-# claude_monitor
+# AI Monitor（Codex / Claude 监工）
 
-一个基于 `tmux` 的“AI 监工/保活”小工具：持续读取目标面板的输出，在空闲时自动向该面板发送一条回复，让面板里的 AI（如 Claude Code）继续推进任务。
+一个基于 `tmux` 的“AI 监工/保活”小工具：持续读取目标面板的输出，在空闲时自动向该面板发送一条回复，让面板里的 AI（如 OpenAI Codex TUI、Claude Code、Cursor 等）继续推进任务。
 
 ## 功能
 
@@ -130,6 +130,11 @@ cm "2:mon.0"
 日志控制（可选）：
 
 - `AI_MONITOR_LOG_MAX_BYTES`：单个日志文件最大字节数，默认 `10485760`（10MB），超过则截断保留末尾
+
+提示词控制（避免“一直 continue”）：
+
+- 默认系统提示词会严格要求**优先输出 `WAIT`**，只有在明确需要推进任务时才给出具体指令；若想进一步自定义，可创建 `prompt.txt` 并使用 `--system-prompt-file prompt.txt`（或设置 `AI_MONITOR_LLM_SYSTEM_PROMPT_FILE`）。
+- 建议在提示词中明确写出：“除非非常确定下一步，否则输出 WAIT，不要机械地回复 continue”。
 
 ## 日志与 PID
 

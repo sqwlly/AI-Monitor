@@ -184,14 +184,12 @@ decide_response_llm() {
     output_lower=$(echo "$recent_output" | tr '[:upper:]' '[:lower:]')
 
     if echo "$recent_output" | grep -qE '(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Running|Executing|Loading|Compiling|Building|Installing|Downloading)'; then
-        log "⏸️  WAIT（检测到可能仍在运行中）"
         echo "WAIT"
         return
     fi
 
     if echo "$output_lower" | grep -qE '(do you want to|would you like to|should i|shall i|confirm|are you sure|proceed\?|continue\?|\[y/n\]|\(y/n\)|yes/no)'; then
         if echo "$output_lower" | grep -qE '(delete|remove|drop|reset|force|overwrite|replace all|destructive|rm -rf|wipe)'; then
-            log "⏸️  WAIT（检测到危险确认）"
             echo "WAIT"
             return
         fi
@@ -237,9 +235,6 @@ decide_response_llm() {
     if [ -z "$response" ]; then
         log "⚠️  LLM 调用失败或返回空内容，本轮不发送"
         response="WAIT"
-    fi
-    if [ "$response" = "WAIT" ]; then
-        log "⏸️  LLM 回复 WAIT"
     fi
     echo "$response"
 }
@@ -314,10 +309,7 @@ while true; do
             response=$(decide_response_llm "$current_output" "$last_response" "$same_response_count")
 
             # 检查是否需要等待
-            if [ "$response" = "WAIT" ]; then
-                log "⏸️  WAIT，本轮不发送命令"
-                last_change_time=$current_time
-            else
+            if [ "$response" != "WAIT" ]; then
                 # 防止重复发送相同回复
                 if [ "$response" = "$last_response" ]; then
                     ((same_response_count++))
@@ -333,13 +325,10 @@ while true; do
                 send_command "$response"
 
                 last_response="$response"
-                last_change_time=$current_time
             fi
+            last_change_time=$current_time
         else
-            # 每30秒输出一次等待状态（避免日志过多）
-            if [ $((idle_duration % 30)) -lt $CHECK_INTERVAL ]; then
-                log "⏳ 空闲 ${idle_duration}/${MIN_IDLE_TIME}秒"
-            fi
+            :
         fi
     fi
 

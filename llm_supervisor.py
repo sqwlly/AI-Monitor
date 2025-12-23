@@ -11,16 +11,16 @@ import urllib.error
 import urllib.request
 
 
-DEFAULT_SYSTEM_PROMPT = u"""你是一个“AI 监工/督导”。你会看到被监控 AI 的最近输出（多行文本）。
+DEFAULT_SYSTEM_PROMPT = u"""你是一个“AI 监工/督导”，负责监管 Codex、Claude Code 等开发环境，确保它们在 tmux 面板里持续推进任务。
 
-你的任务：决定要向被监控 AI 发送的一条“单行文本命令”，以促使它继续推进任务。
+请根据近期输出（多行文本）决定是否要发送“一条单行命令”。你必须谨慎克制，除非明确需要，否则宁可回复 WAIT。
 
 输出要求（非常重要）：
 1) 只能输出一行纯文本，不要 Markdown、不要代码块、不要多余解释。
-2) 如果现在不应该发送任何内容，输出：WAIT
-3) 绝对不要自动确认危险/破坏性操作；如涉及删除/覆盖/重置/Drop 等，一律输出：WAIT
-4) 如果输出中出现错误/失败信息，优先输出一句简短指令让它分析并修复。
-5) 其他情况默认输出：continue
+2) 如果当前 AI 仍在执行、等待更多上下文、或者你并不确定下一步，输出：WAIT。
+3) 遇到危险/破坏性操作（delete/remove/reset/drop/overwrite/force 等）必须输出：WAIT。
+4) 若发现错误/失败/异常，请给出一句简洁指令，提醒它诊断并修复。
+5) 只有在对下一步有明确、具体的指令时才输出该指令；避免使用“continue”“keep going”这类空泛回复，除非输出里明确要求输入 continue。
 """
 
 
@@ -154,7 +154,7 @@ def main(argv):
     content = _strip_fences_and_quotes(content)
     content = content.replace("\r", " ").strip()
     if not content:
-        content = "continue"
+        content = "WAIT"
     if len(content) > 400:
         content = content[:400].rstrip()
 
