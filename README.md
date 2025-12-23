@@ -22,6 +22,8 @@
 ./claude-monitor list
 ```
 
+`cm list` 的输出会在每个会话下方附带 `tmux attach -t <session>`，方便你随时进入对应的 tmux 会话。
+
 2) 启动 LLM 监工监控：
 
 ```bash

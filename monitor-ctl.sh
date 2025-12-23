@@ -104,6 +104,7 @@ list_tmux_panes() {
     echo ""
     tmux list-sessions -F "#{session_name}" 2>/dev/null | while read session; do
         echo -e "${GREEN}会话: $session${NC}"
+        echo "  进入命令: tmux attach -t $session"
         tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null | while read window; do
             window_index=$(echo $window | cut -d: -f1)
             window_name=$(echo $window | cut -d: -f2)
