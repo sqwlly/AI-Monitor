@@ -304,10 +304,12 @@ decide_response_llm() {
         llm_args+=(--system-prompt-file "$LLM_SYSTEM_PROMPT_FILE")
     fi
 
-    local preview_lines
-    preview_lines="$(echo "$recent_output" | tail -n 5)"
+    local total_lines preview_limit preview_lines
+    total_lines="$(printf "%s" "$output" | wc -l | tr -d ' ')"
+    preview_limit=15
+    preview_lines="$(printf "%s" "$output" | tail -n "$preview_limit")"
     if [ -n "$preview_lines" ]; then
-        log "🧾 LLM 输入片段 (最近 5 行):"
+        log "🧾 LLM 输入片段 (共 ${total_lines:-0} 行，展示末尾 $preview_limit 行)："
         while IFS= read -r preview_line; do
             log "   $preview_line"
         done <<< "$preview_lines"
