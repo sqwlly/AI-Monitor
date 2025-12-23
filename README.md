@@ -42,6 +42,16 @@
 ./claude-monitor stop   # 停止所有
 ```
 
+5) 想直接进入被监控的 tmux 面板进行人工干预，可先附着会话再选窗口/面板：
+
+```bash
+tmux attach -t 2        # 进入会话 2（或使用名字）
+Ctrl+b w                # 在 tmux 中列出窗口，选择 mon
+Ctrl+b q                # 显示面板编号，选择目标面板
+```
+
+如需重新回到背景运行的监控，只需在 tmux 中 `Ctrl+b d` 即可 detach。
+
 ## 安装成命令（建议）
 
 把 `claude-monitor` 放进你的 `PATH`（推荐软链接到 `~/.local/bin`）。你也可以安装成更短的命令名（例如 `cm`）：
