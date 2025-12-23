@@ -16,6 +16,64 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+ROLE_CHOICES=("auto" "monitor" "senior-engineer" "test-manager" "architect" "ui-designer" "algo-engineer")
+
+role_choice_description() {
+    case "$1" in
+        auto) echo "自动择优（根据阶段切换角色）" ;;
+        monitor) echo "默认监工，偏保守" ;;
+        senior-engineer) echo "高级研发，主动推进编码/调试" ;;
+        test-manager) echo "测试经理，侧重验证与风控" ;;
+        architect) echo "架构师，负责拆分设计" ;;
+        ui-designer) echo "产品/UI 设计师" ;;
+        algo-engineer) echo "算法工程师" ;;
+        *) echo "" ;;
+    esac
+}
+
+prompt_role_choice() {
+    local default_role="${AI_MONITOR_LLM_ROLE:-auto}"
+    local total="${#ROLE_CHOICES[@]}"
+
+    echo ""
+    echo "请选择 LLM 角色（回车默认为: $default_role）："
+    local index=1
+    for role in "${ROLE_CHOICES[@]}"; do
+        local desc
+        desc="$(role_choice_description "$role")"
+        local marker=""
+        if [ "$role" = "$default_role" ]; then
+            marker="(默认)"
+        fi
+        printf "  %d) %-17s %s %s\n" "$index" "$role" "$desc" "$marker"
+        index=$((index + 1))
+    done
+    echo -n "输入编号或名称: "
+    read -r selection
+
+    if [ -z "$selection" ]; then
+        echo "$default_role"
+        return
+    fi
+
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+        local num=$selection
+        if [ "$num" -ge 1 ] && [ "$num" -le "$total" ]; then
+            echo "${ROLE_CHOICES[$((num - 1))]}"
+            return
+        fi
+    fi
+
+    for role in "${ROLE_CHOICES[@]}"; do
+        if [ "$selection" = "$role" ]; then
+            echo "$role"
+            return
+        fi
+    done
+
+    echo "$default_role"
+}
+
 show_help() {
     cat << EOF
 用法: ${CMD} {run|stop|restart|status|logs|tail|list|clean|install|test} [参数]
@@ -166,12 +224,50 @@ start_llm_monitor() {
 
         # 后台启动 LLM 监工监控
         shift
-        nohup bash "$smart_script" "$target" "$@" > /dev/null 2>&1 &
+        local extra_args=("$@")
+        local configured_role=""
+        local has_explicit_role=0
+        local idx=0
+        local args_count="${#extra_args[@]}"
+        while [ $idx -lt $args_count ]; do
+            if [ "${extra_args[$idx]}" = "--role" ]; then
+                has_explicit_role=1
+                if [ $((idx + 1)) -lt $args_count ]; then
+                    configured_role="${extra_args[$((idx + 1))]}"
+                else
+                    configured_role="(missing)"
+                fi
+                break
+            fi
+            idx=$((idx + 1))
+        done
+
+        if [ $has_explicit_role -eq 0 ]; then
+            if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
+                configured_role="${AI_MONITOR_LLM_ROLE}"
+            elif [ -t 0 ]; then
+                local chosen_role
+                chosen_role="$(prompt_role_choice)"
+                if [ -z "$chosen_role" ]; then
+                    chosen_role="auto"
+                fi
+                extra_args=(--role "$chosen_role" "${extra_args[@]}")
+                configured_role="$chosen_role"
+            else
+                extra_args=(--role "auto" "${extra_args[@]}")
+                configured_role="auto"
+            fi
+        fi
+
+        nohup bash "$smart_script" "$target" "${extra_args[@]}" > /dev/null 2>&1 &
         sleep 1
 
         echo -e "${GREEN}✓ 已启动 LLM 监工监控 🧠${NC}"
         echo "  目标: $target"
         echo "  模式: LLM 监工（OpenAI 兼容接口）"
+        if [ -n "$configured_role" ]; then
+            echo "  角色: $configured_role"
+        fi
         echo "  日志: $LOG_DIR/smart_${session}_${window}_${pane}.log"
         echo ""
         echo "使用 '${CMD} tail $target' 实时查看日志"

@@ -32,6 +32,8 @@
 ./claude-monitor run "2:mon.0" --model "gpt-4o-mini"
 ```
 
+若未通过 `--role` 或环境变量指定 persona，CLI 会在启动前提示选择（默认 `auto`，可直接回车）。
+
 3) 查看状态 / 跟踪日志：
 
 ```bash
@@ -150,6 +152,7 @@ cm "2:mon.0" --role test-manager           # 专注测试/质量任务
 ```
 
 当启用 `auto` 时，脚本会把 `[monitor-meta] stage` 与 `stage_history` 注入到提示词里，帮助 LLM 判断当前研发阶段（planning/coding/testing/release/done 等）与推进程度，从而自动决定继续开发、切换职责或输出 `WAIT`。
+使用 `cm run <target>` 且未指定角色时，CLI 会先弹出角色选择列表（默认 `auto`），便于随手切换语气。
 
 提示词位于 `prompts/<role>.txt`，可按需修改或新增同名文件来自定义 persona。
 
