@@ -266,12 +266,14 @@ decide_response_llm() {
     output_lower=$(echo "$recent_output" | tr '[:upper:]' '[:lower:]')
 
     if echo "$recent_output" | grep -qE '(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Running|Executing|Loading|Compiling|Building|Installing|Downloading)'; then
+        log "⏸️ 检测到任务仍在运行中，返回 WAIT"
         echo "WAIT"
         return
     fi
 
     if echo "$output_lower" | grep -qE '(do you want to|would you like to|should i|shall i|confirm|are you sure|proceed\?|continue\?|\[y/n\]|\(y/n\)|yes/no)'; then
         if echo "$output_lower" | grep -qE '(delete|remove|drop|reset|force|overwrite|replace all|destructive|rm -rf|wipe)'; then
+            log "⏸️ 检测到危险确认提示，返回 WAIT"
             echo "WAIT"
             return
         fi
@@ -306,7 +308,7 @@ decide_response_llm() {
 
     local total_lines preview_limit preview_lines
     total_lines="$(printf "%s" "$output" | wc -l | tr -d ' ')"
-    preview_limit=15
+    preview_limit=10
     preview_lines="$(printf "%s" "$output" | tail -n "$preview_limit")"
     if [ -n "$preview_lines" ]; then
         log "🧾 LLM 输入片段 (共 ${total_lines:-0} 行，展示末尾 $preview_limit 行)："
@@ -343,6 +345,10 @@ decide_response_llm() {
     if [ -z "$response" ]; then
         log "⚠️  LLM 调用失败或返回空内容，本轮不发送"
         response="WAIT"
+    fi
+    log "✨ LLM 输出: $response"
+    if [ "$response" = "WAIT" ]; then
+        log "⏸️ LLM 回复 WAIT，本轮不发送命令"
     fi
     echo "$response"
 }
