@@ -304,6 +304,16 @@ decide_response_llm() {
         llm_args+=(--system-prompt-file "$LLM_SYSTEM_PROMPT_FILE")
     fi
 
+    local preview_lines
+    preview_lines="$(echo "$recent_output" | tail -n 5)"
+    if [ -n "$preview_lines" ]; then
+        log "🧾 LLM 输入片段 (最近 5 行):"
+        while IFS= read -r preview_line; do
+            log "   $preview_line"
+        done <<< "$preview_lines"
+    fi
+    log "🤖 正在请求 LLM (role=${LLM_ROLE:-unknown}, stage=${CURRENT_STAGE:-unknown})"
+
     local llm_input="$output"
     local meta_block=""
     if [ -n "$last_response" ]; then
