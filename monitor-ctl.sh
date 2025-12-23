@@ -44,6 +44,7 @@ LLM 监工参数（传给 run / 默认 target 调用）:
   --model <model>
   --base-url <url>         # OpenAI 兼容接口（如 Ollama: http://localhost:11434/v1）
   --api-key <key>
+  --role <role>
   --timeout <sec>
   --system-prompt-file <file>
 
@@ -117,10 +118,10 @@ list_tmux_panes() {
                 # 高亮显示可能是 Claude Code 的面板
                 if echo "$pane_cmd" | grep -qi "claude"; then
                     echo -e "    ${YELLOW}→ 面板 $pane_index: $pane_cmd ⭐${NC}"
-                    echo -e "      ${YELLOW}监控命令: ${CMD} \"$session:$window_name.$pane_index\"${NC}"
+                    echo -e "      ${YELLOW}监控命令: ${CMD} ${session}:${window_name}.${pane_index}${NC}"
                 else
                     echo "    → 面板 $pane_index: $pane_cmd"
-                    echo "      监控命令: ${CMD} \"$session:$window_name.$pane_index\""
+                    echo "      监控命令: ${CMD} ${session}:${window_name}.${pane_index}"
                 fi
             done
         done

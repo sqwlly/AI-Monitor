@@ -21,7 +21,7 @@ if [ -z "${1:-}" ]; then
         exit 1
     }
     echo ""
-    echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>]"
+    echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>] [--role <role>]"
     echo "例如: ./smart-monitor.sh 2:mon.0"
     exit 1
 fi
@@ -34,6 +34,7 @@ LLM_API_KEY=""
 LLM_MODEL=""
 LLM_TIMEOUT=""
 LLM_SYSTEM_PROMPT_FILE=""
+LLM_ROLE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -53,6 +54,10 @@ while [ $# -gt 0 ]; do
             LLM_MODEL="${2:-}"
             shift 2
             ;;
+        --role)
+            LLM_ROLE="${2:-}"
+            shift 2
+            ;;
         --timeout)
             LLM_TIMEOUT="${2:-}"
             shift 2
@@ -62,7 +67,7 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         -h|--help)
-            echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>] [--timeout <sec>] [--system-prompt-file <file>]"
+            echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>] [--role <role>] [--timeout <sec>] [--system-prompt-file <file>]"
             exit 0
             ;;
         *)
@@ -101,6 +106,14 @@ if [ -z "$LLM_MODEL" ]; then
     fi
 fi
 
+if [ -z "$LLM_ROLE" ]; then
+    if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
+        LLM_ROLE="$AI_MONITOR_LLM_ROLE"
+    else
+        LLM_ROLE="monitor"
+    fi
+fi
+
 # 解析格式: session:window.pane
 if [[ $TARGET =~ ^([^:]+):([^.]+)\.([0-9]+)$ ]]; then
     TMUX_SESSION="${BASH_REMATCH[1]}"
@@ -119,6 +132,10 @@ CHECK_INTERVAL=8          # 检查间隔（秒）
 MIN_IDLE_TIME=12          # 空闲阈值（秒）
 MAX_RETRY_SAME=3          # 同一回复最大重试次数
 LOG_MAX_BYTES="${AI_MONITOR_LOG_MAX_BYTES:-10485760}"  # 默认 10MB（超过则截断保留末尾）
+MAX_STAGE_HISTORY=6       # 记录最近阶段变更
+
+CURRENT_STAGE="unknown"
+STAGE_HISTORY=""
 
 if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]]; then
     LOG_MAX_BYTES=10485760
@@ -170,6 +187,71 @@ send_command() {
     tmux send-keys -t "$TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE" C-m
 }
 
+append_stage_history() {
+    local stage="$1"
+    if [ -z "$stage" ]; then
+        return
+    fi
+    local -a entries=()
+    if [ -n "$STAGE_HISTORY" ]; then
+        local IFS='>'
+        read -r -a entries <<< "$STAGE_HISTORY"
+    fi
+    entries+=("$stage")
+    while [ "${#entries[@]}" -gt "$MAX_STAGE_HISTORY" ]; do
+        entries=("${entries[@]:1}")
+    done
+    local IFS='>'
+    STAGE_HISTORY="${entries[*]}"
+}
+
+detect_stage_from_output() {
+    local text_lower stage
+    text_lower="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
+
+    if echo "$text_lower" | grep -qE "(blocked|waiting for|pending approval|on hold)"; then
+        stage="blocked"
+    elif echo "$text_lower" | grep -qE "(error|exception|traceback|failed|panic|stack trace|bug)"; then
+        stage="fixing"
+    elif echo "$text_lower" | grep -qE "(deploy|release|publish|ship|delivery)"; then
+        stage="release"
+    elif echo "$text_lower" | grep -qE "(test pass|tests pass|pytest|jest|unit test|integration test|coverage|e2e)"; then
+        if echo "$text_lower" | grep -qE "(fail|error|exception)"; then
+            stage="fixing"
+        else
+            stage="testing"
+        fi
+    elif echo "$text_lower" | grep -qE "(refactor|optimi|cleanup|polish)"; then
+        stage="refining"
+    elif echo "$text_lower" | grep -qE "(implement|coding|write code|create file|function|class|generate code|apply_patch)"; then
+        stage="coding"
+    elif echo "$text_lower" | grep -qE "(plan|todo|design|spec|architecture|requirement)"; then
+        stage="planning"
+    elif echo "$text_lower" | grep -qE "(doc|documentation|readme|guide|write docs|changelog)"; then
+        stage="documenting"
+    elif echo "$text_lower" | grep -qE "(done|complete|all tasks completed|ready to ship|finalized)"; then
+        stage="done"
+    else
+        stage="unknown"
+    fi
+
+    printf "%s" "$stage"
+}
+
+update_stage_tracker() {
+    local detected_stage
+    detected_stage="$(detect_stage_from_output "$1")"
+    if [ -z "$detected_stage" ] || [ "$detected_stage" = "unknown" ]; then
+        return
+    fi
+    if [ "$detected_stage" = "$CURRENT_STAGE" ]; then
+        return
+    fi
+    CURRENT_STAGE="$detected_stage"
+    append_stage_history "$CURRENT_STAGE"
+    log "🧭 阶段切换 -> $CURRENT_STAGE"
+}
+
 # 通过 OpenAI 兼容接口让“监工模型”决定要发送的单行回复
 decide_response_llm() {
     local output="$1"
@@ -212,6 +294,9 @@ decide_response_llm() {
     fi
 
     local llm_args=(--base-url "$LLM_BASE_URL" --model "$LLM_MODEL")
+    if [ -n "$LLM_ROLE" ]; then
+        llm_args+=(--role "$LLM_ROLE")
+    fi
     if [ -n "$LLM_TIMEOUT" ]; then
         llm_args+=(--timeout "$LLM_TIMEOUT")
     fi
@@ -220,8 +305,19 @@ decide_response_llm() {
     fi
 
     local llm_input="$output"
+    local meta_block=""
     if [ -n "$last_response" ]; then
-        llm_input="${llm_input}"$'\n\n'"[monitor-meta] last_response: ${last_response}"$'\n'"[monitor-meta] same_response_count: ${same_response_count}"
+        meta_block+="[monitor-meta] last_response: ${last_response}"$'\n'
+    fi
+    meta_block+="[monitor-meta] same_response_count: ${same_response_count}"$'\n'
+    if [ -n "$CURRENT_STAGE" ] && [ "$CURRENT_STAGE" != "unknown" ]; then
+        meta_block+="[monitor-meta] stage: ${CURRENT_STAGE}"$'\n'
+    fi
+    if [ -n "$STAGE_HISTORY" ]; then
+        meta_block+="[monitor-meta] stage_history: ${STAGE_HISTORY}"$'\n'
+    fi
+    if [ -n "$meta_block" ]; then
+        llm_input="${llm_input}"$'\n\n'"${meta_block}"
     fi
 
     local response
@@ -254,7 +350,7 @@ log "━━━━━━━━━━━━━━━━━━━━━━━━━
 log "📍 监控目标: $TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE"
 log "⏱️  检查间隔: ${CHECK_INTERVAL}秒"
 log "⏳ 空闲阈值: ${MIN_IDLE_TIME}秒"
-log "🧠 模式: LLM 监工 (model=$LLM_MODEL)"
+log "🧠 模式: LLM 监工 (model=$LLM_MODEL, role=$LLM_ROLE)"
 log "🌐 base-url: $LLM_BASE_URL"
 if [ -n "$LLM_API_KEY" ]; then
     log "🔑 api-key: set"
@@ -293,6 +389,8 @@ while true; do
         rm -f "$PID_FILE"
         exit 1
     fi
+
+    update_stage_tracker "$current_output"
 
     current_time=$(date +%s)
 
