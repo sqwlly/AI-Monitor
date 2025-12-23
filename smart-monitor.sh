@@ -299,7 +299,6 @@ while true; do
     # 检查输出是否有变化
     if [ "$current_output" != "$previous_output" ]; then
         last_change_time=$current_time
-        log "✓ 检测到输出变化"
         previous_output="$current_output"
         same_response_count=0  # 重置计数器
     else
