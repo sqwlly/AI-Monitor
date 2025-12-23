@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_path() {
+    local source="$1"
+
+    if [[ "$source" != /* ]] && [[ "$source" != */* ]]; then
+        local resolved
+        resolved="$(command -v "$source" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then
+            source="$resolved"
+        fi
+    fi
+
+    while [ -h "$source" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        [[ "$source" != /* ]] && source="${dir}/${source}"
+    done
+
+    echo "$source"
+}
+
+script_path="$(resolve_script_path "${BASH_SOURCE[0]}")"
+script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+export CLAUDE_MONITOR_CMD="$(basename "${0}")"
+exec bash "${script_dir}/monitor-ctl.sh" "$@"
