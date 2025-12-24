@@ -6,7 +6,7 @@
 
 - **LLM 监工**：把最近输出交给另一个模型（OpenAI 兼容接口）生成“单行回复”，并发送回目标面板
 - **多角色提示词**：内置 `monitor / architect / ui-designer / game-designer / algo-engineer / senior-engineer / test-manager`，并支持 `--role auto` 由脚本根据阶段自动选角（更可预测、可回放）
-- **研发阶段感知**：实时解析面板输出得到 `planning / coding / testing / release / done / fixing` 等阶段，并通过 `[monitor-meta] stage*` 提供给 LLM；auto 模式会基于阶段稳定切换 persona 或暂停
+- **研发阶段感知**：以规则为主解析面板输出得到 `planning / coding / testing / fixing / refining / documenting / release / done` 等阶段，并通过 `[monitor-meta] stage*` 提供给 LLM；同时支持 LLM 以 `STAGE=...; CMD=...` 形式给出阶段建议（仅在规则不确定时采纳）；auto 模式会基于阶段稳定切换 persona 或暂停
 - **支持千问（Qwen）**：可用本地 Ollama（OpenAI 兼容接口）运行 `qwen2.5*` 作为监工模型
 - **安全默认**：检测到“进行中/危险确认”时输出 `WAIT`，避免自动确认破坏性操作
 
@@ -33,6 +33,8 @@
 ```
 
 若未通过 `--role` 或环境变量指定 persona，CLI 会在启动前提示选择（默认 `auto`，可直接回车）。
+
+说明：`target` 里的“窗口”既支持窗口名也支持窗口编号；为避免重名/歧义，推荐使用编号（例如 `2:1.0`）。`cm list` 默认会输出编号形式的 target。
 
 3) 查看状态 / 跟踪日志：
 

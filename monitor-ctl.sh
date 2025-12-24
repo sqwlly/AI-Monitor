@@ -70,6 +70,52 @@ read_pid_meta() {
     printf "%s" "${line#*=}"
 }
 
+is_numeric_pid() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ]
+}
+
+get_pid_cmdline() {
+    local pid="${1:-}"
+    if ! is_numeric_pid "$pid"; then
+        return 1
+    fi
+
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true
+        return 0
+    fi
+
+    ps -o command= -p "$pid" 2>/dev/null || true
+    return 0
+}
+
+pid_matches_monitor_process() {
+    local pid="${1:-}"
+    local expected_target="${2:-}"
+    local cmdline
+
+    if ! is_numeric_pid "$pid"; then
+        return 1
+    fi
+    if ! ps -p "$pid" > /dev/null 2>&1; then
+        return 1
+    fi
+
+    cmdline="$(get_pid_cmdline "$pid")"
+    if [ -z "$cmdline" ]; then
+        return 1
+    fi
+
+    if ! printf "%s" "$cmdline" | grep -Fq "smart-monitor.sh"; then
+        return 1
+    fi
+    if [ -n "$expected_target" ] && ! printf "%s" "$cmdline" | grep -Fq "$expected_target"; then
+        return 2
+    fi
+    return 0
+}
+
 role_choice_description() {
     case "$1" in
         auto) echo "自动择优（根据阶段切换角色）" ;;
@@ -126,8 +172,17 @@ prompt_role_choice() {
     local default_role="${AI_MONITOR_LLM_ROLE:-auto}"
     local total="${#ROLE_CHOICES[@]}"
 
-    echo ""
-    echo "请选择 LLM 角色（回车默认为: $default_role）："
+    local input="/dev/stdin"
+    local out="/dev/fd/2"
+    if [ -r /dev/tty ]; then
+        input="/dev/tty"
+    fi
+    if [ -w /dev/tty ]; then
+        out="/dev/tty"
+    fi
+
+    printf "%s\n" "" > "$out"
+    printf "%s\n" "请选择 LLM 角色（回车默认为: $default_role）：" > "$out"
     local index=1
     for role in "${ROLE_CHOICES[@]}"; do
         local desc
@@ -139,11 +194,11 @@ prompt_role_choice() {
         if [ "$role" = "$default_role" ]; then
             marker="(默认)"
         fi
-        printf "  %d) %-17s %s %s\n" "$index" "$role" "$desc" "$marker"
+        printf "  %d) %-17s %s %s\n" "$index" "$role" "$desc" "$marker" > "$out"
         index=$((index + 1))
     done
-    echo -n "输入编号或名称: "
-    read -r selection
+    printf "%s" "输入编号或名称: " > "$out"
+    read -r selection < "$input"
 
     if [ -z "$selection" ]; then
         echo "$default_role"
@@ -185,7 +240,7 @@ show_help() {
   test                  - 测试 LLM 配置与连通性（不启动监控）
 
 参数格式:
-  target: 会话:窗口.面板 (例如: 2:mon.0)
+  target: 会话:窗口.面板（窗口可用编号或名称；推荐用编号以避免重名/歧义，例如: 2:1.0 或 2:mon.0）
 
 快捷方式:
   - 直接传 target：${CMD} "2:mon.0"      # 等同于 run
@@ -218,28 +273,58 @@ is_target() {
     [[ "$value" =~ ^([^:]+):([^.]+)\.([0-9]+)$ ]]
 }
 
+resolve_window_index() {
+    local session="${1:-}"
+    local selector="${2:-}"
+    if [ -z "$session" ] || [ -z "$selector" ]; then
+        echo "$selector"
+        return 0
+    fi
+    if [[ "$selector" =~ ^[0-9]+$ ]]; then
+        echo "$selector"
+        return 0
+    fi
+    local idx
+    idx="$(tmux list-windows -t "$session" -F "#{window_index}	#{window_name}" 2>/dev/null | awk -F'\t' -v name="$selector" '$2==name {print $1; exit}' || true)"
+    if [ -n "$idx" ]; then
+        echo "$idx"
+        return 0
+    fi
+    echo "$selector"
+}
+
 prompt_target() {
-    echo "📋 可用的 tmux 会话:"
-    echo "----------------------------------------"
+    local input="/dev/stdin"
+    local out="/dev/fd/2"
+    if [ -r /dev/tty ]; then
+        input="/dev/tty"
+    fi
+    if [ -w /dev/tty ]; then
+        out="/dev/tty"
+    fi
+
+    printf "%s\n" "📋 可用的 tmux 会话:" > "$out"
+    printf "%s\n" "----------------------------------------" > "$out"
     tmux list-sessions 2>/dev/null || {
-        echo -e "${RED}❌ 没有运行中的 tmux 会话${NC}"
+        printf "%b\n" "${RED}❌ 没有运行中的 tmux 会话${NC}" > "$out"
         exit 1
     }
-    echo ""
-    echo -n "输入会话名称或编号: "
-    read -r session
+    printf "%s\n" "" > "$out"
+    printf "%s" "输入会话名称或编号: " > "$out"
+    read -r session < "$input"
 
-    echo ""
-    echo "📋 该会话可用窗口:"
+    printf "%s\n" "" > "$out"
+    printf "%s\n" "📋 该会话可用窗口:" > "$out"
     tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null || true
-    echo -n "输入窗口名称或编号: "
-    read -r window
+    printf "%s" "输入窗口名称或编号: " > "$out"
+    read -r window < "$input"
+    window="$(resolve_window_index "$session" "$window")"
 
-    echo ""
-    echo "📋 该窗口可用面板:"
+    printf "%s\n" "" > "$out"
+    printf "%s\n" "📋 该窗口可用面板:" > "$out"
     tmux list-panes -t "$session:$window" -F "#{pane_index}: #{pane_current_command}" 2>/dev/null || true
-    echo -n "输入面板编号 [默认:0]: "
-    read -r pane
+    printf "%s" "输入面板编号 [默认:0]: " > "$out"
+    read -r pane < "$input"
     pane="${pane:-0}"
 
     echo "${session}:${window}.${pane}"
@@ -270,21 +355,21 @@ list_tmux_panes() {
             while IFS= read -r pane; do
                 local pane_index="${pane%%:*}"
                 local pane_cmd="${pane#*: }"
-                local target="${session}:${window_name}.${pane_index}"
+                local target="${session}:${window_index}.${pane_index}"
 
                 pane_targets+=("$target")
-                pane_labels+=("${target}  ${pane_cmd}")
+                pane_labels+=("${target}  ${pane_cmd}  (window=${window_name})")
                 
                 # 高亮显示可能是 Claude Code 的面板
                 if echo "$pane_cmd" | grep -qi "claude"; then
                     echo -e "    ${YELLOW}→ 面板 $pane_index: $pane_cmd ⭐${NC}"
-                    echo -e "      ${YELLOW}监控命令: ${CMD} \"${target}\"${NC}"
+                    echo -e "      ${YELLOW}监控命令: ${CMD} \"${target}\"  (window=${window_name})${NC}"
                 else
                     echo "    → 面板 $pane_index: $pane_cmd"
-                    echo "      监控命令: ${CMD} \"${target}\""
+                    echo "      监控命令: ${CMD} \"${target}\"  (window=${window_name})"
                 fi
                 if [ -z "${AI_MONITOR_LLM_ROLE:-}" ]; then
-                    echo "      角色选择: 启动后可在提示中挑选 persona（默认 auto）"
+                    echo "      角色选择: 交互终端启动时会提示选择（默认 auto）"
                 fi
             done < <(tmux list-panes -t "$session:$window_index" -F "#{pane_index}: #{pane_current_command}" 2>/dev/null || true)
         done < <(tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null || true)
@@ -323,17 +408,18 @@ list_tmux_panes() {
         fi
 
         start_llm_monitor "$chosen_target"
+        # 启动后自动进入 tail 模式
+        echo ""
+        tail_logs "$chosen_target"
     fi
 }
 
 start_llm_monitor() {
     local target="$1"
-    local prompted_target=0
 
     if [ -z "$target" ]; then
         if [ -t 0 ]; then
             target="$(prompt_target)"
-            prompted_target=1
         else
             echo -e "${RED}错误: 请指定要监控的面板${NC}"
             echo "使用 '${CMD} list' 查看可用面板"
@@ -360,7 +446,7 @@ start_llm_monitor() {
 
         if [ -f "$pid_file" ]; then
             pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
-            if ps -p $pid > /dev/null 2>&1; then
+            if pid_matches_monitor_process "$pid" ""; then
                 echo -e "${YELLOW}该面板已在 LLM 监工监控中 (PID: $pid)${NC}"
                 return
             fi
@@ -389,7 +475,7 @@ start_llm_monitor() {
         if [ $has_explicit_role -eq 0 ]; then
             if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
                 configured_role="${AI_MONITOR_LLM_ROLE}"
-            elif [ -t 0 ] && [ $prompted_target -eq 1 ]; then
+            elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
                 local chosen_role
                 chosen_role="$(prompt_role_choice)"
                 if [ -z "$chosen_role" ]; then
@@ -433,12 +519,18 @@ stop_monitor() {
             for pid_file in "$LOG_DIR"/*.pid; do
                 if [ -f "$pid_file" ]; then
                     pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
-                    if ps -p $pid > /dev/null 2>&1; then
-                        kill $pid
+                    if ! is_numeric_pid "$pid" || ! ps -p "$pid" > /dev/null 2>&1; then
+                        rm -f "$pid_file"
+                        continue
+                    fi
+                    if pid_matches_monitor_process "$pid" ""; then
+                        kill "$pid"
                         echo -e "${GREEN}✓ 已停止 $(basename ${pid_file%.pid})${NC}"
                         stopped=1
+                        rm -f "$pid_file"
+                    else
+                        echo -e "${YELLOW}⚠️  跳过停止：PID 存在但不匹配 smart-monitor 进程 (PID: $pid, file: $pid_file)${NC}"
                     fi
-                    rm -f "$pid_file"
                 fi
             done
         fi
@@ -459,12 +551,16 @@ stop_monitor() {
             pid_file="$LOG_DIR/monitor_${session}_${window}_${pane}.pid"
             if [ -f "$pid_file" ]; then
                 pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
-                if ps -p $pid > /dev/null 2>&1; then
-                    kill $pid
+                if ! is_numeric_pid "$pid" || ! ps -p "$pid" > /dev/null 2>&1; then
+                    rm -f "$pid_file"
+                elif pid_matches_monitor_process "$pid" "$target"; then
+                    kill "$pid"
                     echo -e "${GREEN}✓ 已停止旧版本监控 $target${NC}"
                     stopped=1
+                    rm -f "$pid_file"
+                else
+                    echo -e "${YELLOW}⚠️  跳过停止旧版本监控：PID 存在但不匹配 (PID: $pid, file: $pid_file)${NC}"
                 fi
-                rm -f "$pid_file"
             fi
 
             # 当前：smart_<hash>.pid（LLM 监工）
@@ -474,12 +570,16 @@ stop_monitor() {
                 smart_pid_file="$LOG_DIR/smart_${target_id}.pid"
                 if [ -f "$smart_pid_file" ]; then
                     pid="$(head -n 1 "$smart_pid_file" 2>/dev/null || true)"
-                    if ps -p $pid > /dev/null 2>&1; then
-                        kill $pid
+                    if ! is_numeric_pid "$pid" || ! ps -p "$pid" > /dev/null 2>&1; then
+                        rm -f "$smart_pid_file"
+                    elif pid_matches_monitor_process "$pid" ""; then
+                        kill "$pid"
                         echo -e "${GREEN}✓ 已停止 LLM 监工监控 $target${NC}"
                         stopped=1
+                        rm -f "$smart_pid_file"
+                    else
+                        echo -e "${YELLOW}⚠️  跳过停止：PID 存在但不匹配 smart-monitor 进程 (PID: $pid, file: $smart_pid_file)${NC}"
                     fi
-                    rm -f "$smart_pid_file"
                 fi
             fi
 
@@ -487,12 +587,16 @@ stop_monitor() {
             local legacy_smart_pid_file="$LOG_DIR/smart_${session}_${window}_${pane}.pid"
             if [ -f "$legacy_smart_pid_file" ]; then
                 pid="$(head -n 1 "$legacy_smart_pid_file" 2>/dev/null || true)"
-                if ps -p $pid > /dev/null 2>&1; then
-                    kill $pid
+                if ! is_numeric_pid "$pid" || ! ps -p "$pid" > /dev/null 2>&1; then
+                    rm -f "$legacy_smart_pid_file"
+                elif pid_matches_monitor_process "$pid" ""; then
+                    kill "$pid"
                     echo -e "${GREEN}✓ 已停止旧命名 LLM 监工监控 $target${NC}"
                     stopped=1
+                    rm -f "$legacy_smart_pid_file"
+                else
+                    echo -e "${YELLOW}⚠️  跳过停止：PID 存在但不匹配 smart-monitor 进程 (PID: $pid, file: $legacy_smart_pid_file)${NC}"
                 fi
-                rm -f "$legacy_smart_pid_file"
             fi
 
             if [ $stopped -eq 0 ]; then
@@ -507,7 +611,7 @@ show_status() {
     echo "📊 监控状态"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    if [ ! -d "$LOG_DIR" ] || [ -z "$(ls -A $LOG_DIR/*.pid 2>/dev/null)" ]; then
+    if [ ! -d "$LOG_DIR" ] || ! compgen -G "$LOG_DIR/*.pid" > /dev/null; then
         echo -e "${YELLOW}没有运行中的监控${NC}"
         echo ""
         echo "使用 '${CMD} list' 查看可监控的面板"
@@ -543,7 +647,7 @@ show_status() {
                 target="(unknown)"
             fi
 
-            if ps -p $pid > /dev/null 2>&1; then
+            if pid_matches_monitor_process "$pid" ""; then
                 log_file="${pid_file%.pid}.log"
 
                 if [ "$mode" = "smart" ]; then
@@ -560,6 +664,12 @@ show_status() {
                         echo "  最后: $last_log"
                     fi
                 fi
+                echo ""
+            elif ps -p "$pid" > /dev/null 2>&1; then
+                echo -e "${YELLOW}⚠️  PID 存在但进程不匹配${NC} - $target"
+                echo "  PID: $pid"
+                echo "  PID 文件: $pid_file"
+                echo "  建议: 可能是 PID 复用/非本工具进程；如需强制清理 pid 文件请手动删除"
                 echo ""
             else
                 echo -e "${RED}✗ 已停止${NC} - $target (陈旧的 PID: $pid)"
@@ -680,7 +790,7 @@ clean_logs() {
     echo -n "确定要清理所有日志吗？(y/N): "
     read -r response
     if [[ "$response" =~ ^[Yy]$ ]]; then
-        rm -rf "$LOG_DIR"/*.log
+        rm -f "$LOG_DIR"/*.log
         echo -e "${GREEN}✓ 日志已清理${NC}"
     else
         echo "取消清理"

@@ -143,6 +143,17 @@ AUTO_ROLE_COOLDOWN_S="${AI_MONITOR_AUTO_ROLE_COOLDOWN_S:-60}"
 AUTO_ROLE_STABLE_COUNT="${AI_MONITOR_AUTO_ROLE_STABLE_COUNT:-2}"
 LAST_DETECTED_STAGE="unknown"
 STAGE_STABLE_COUNT=0
+UNKNOWN_STAGE_STREAK=0
+STAGE_SCORE_THRESHOLD="${AI_MONITOR_STAGE_SCORE_THRESHOLD:-3}"
+STAGE_SCORE_MARGIN="${AI_MONITOR_STAGE_SCORE_MARGIN:-1}"
+LAST_STAGE_DETECTED="unknown"
+LAST_STAGE_SCORE=0
+STAGE_HINT_LAST=""
+STAGE_HINT_STABLE_COUNT=0
+STAGE_HINT_LAST_APPLIED_AT=0
+STAGE_HINT_STABLE_REQUIRED="${AI_MONITOR_STAGE_HINT_STABLE_REQUIRED:-2}"
+STAGE_HINT_COOLDOWN_S="${AI_MONITOR_STAGE_HINT_COOLDOWN_S:-30}"
+LLM_STAGE_HINT=""
 
 if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]]; then
     LOG_MAX_BYTES=10485760
@@ -155,6 +166,18 @@ if ! [[ "$AUTO_ROLE_COOLDOWN_S" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$AUTO_ROLE_STABLE_COUNT" =~ ^[0-9]+$ ]]; then
     AUTO_ROLE_STABLE_COUNT=2
+fi
+if ! [[ "$STAGE_SCORE_THRESHOLD" =~ ^[0-9]+$ ]]; then
+    STAGE_SCORE_THRESHOLD=3
+fi
+if ! [[ "$STAGE_SCORE_MARGIN" =~ ^[0-9]+$ ]]; then
+    STAGE_SCORE_MARGIN=1
+fi
+if ! [[ "$STAGE_HINT_STABLE_REQUIRED" =~ ^[0-9]+$ ]]; then
+    STAGE_HINT_STABLE_REQUIRED=2
+fi
+if ! [[ "$STAGE_HINT_COOLDOWN_S" =~ ^[0-9]+$ ]]; then
+    STAGE_HINT_COOLDOWN_S=30
 fi
 
 # 日志配置
@@ -301,37 +324,224 @@ append_stage_history() {
     STAGE_HISTORY="${entries[*]}"
 }
 
-detect_stage_from_output() {
-    local text_lower stage
+score_stage_from_output() {
+    local text_lower
     text_lower="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')"
 
-    if echo "$text_lower" | grep -qE "(blocked|waiting for|pending approval|on hold)"; then
-        stage="blocked"
-    elif echo "$text_lower" | grep -qE "(error|exception|traceback|failed|panic|stack trace|bug)"; then
-        stage="fixing"
-    elif echo "$text_lower" | grep -qE "(deploy|release|publish|ship|delivery)"; then
-        stage="release"
-    elif echo "$text_lower" | grep -qE "(test pass|tests pass|pytest|jest|unit test|integration test|coverage|e2e)"; then
-        if echo "$text_lower" | grep -qE "(fail|error|exception)"; then
-            stage="fixing"
-        else
-            stage="testing"
-        fi
-    elif echo "$text_lower" | grep -qE "(refactor|optimi|cleanup|polish)"; then
-        stage="refining"
-    elif echo "$text_lower" | grep -qE "(implement|coding|write code|create file|function|class|generate code|apply_patch)"; then
-        stage="coding"
-    elif echo "$text_lower" | grep -qE "(plan|todo|design|spec|architecture|requirement)"; then
-        stage="planning"
-    elif echo "$text_lower" | grep -qE "(doc|documentation|readme|guide|write docs|changelog)"; then
-        stage="documenting"
-    elif echo "$text_lower" | grep -qE "(done|complete|all tasks completed|ready to ship|finalized)"; then
-        stage="done"
-    else
-        stage="unknown"
+    local score_blocked=0
+    local score_fixing=0
+    local score_testing=0
+    local score_coding=0
+    local score_refining=0
+    local score_planning=0
+    local score_documenting=0
+    local score_release=0
+    local score_done=0
+    local score_reviewing=0
+    local score_waiting=0
+
+    if printf "%s" "$text_lower" | grep -qE "(pending approval|on hold|blocked|waiting for input|press (enter|any key)|hit enter to continue|输入以继续|等待输入|请确认|确认\\s*\\(|\\[y/n\\]|\\(y/n\\))"; then
+        score_blocked=$((score_blocked + 3))
     fi
 
-    printf "%s" "$stage"
+    # waiting: 等待用户输入或外部响应
+    if printf "%s" "$text_lower" | grep -qE "(waiting for|awaiting|pending|等待中|挂起)"; then
+        score_waiting=$((score_waiting + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(traceback|stack trace|segmentation fault|segfault|panic|assertion failed)"; then
+        score_fixing=$((score_fixing + 5))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(error|exception|failed|failure|cannot|unable to|fatal)"; then
+        score_fixing=$((score_fixing + 3))
+    fi
+    if printf "%s" "$text_lower" | grep -qE '(^|[^[:alnum:]_])bug([^[:alnum:]_]|$)'; then
+        score_fixing=$((score_fixing + 2))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(错误|异常|失败|崩溃|回溯)"; then
+        score_fixing=$((score_fixing + 3))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(pytest|jest|go test|cargo test|npm test|pnpm test|yarn test|unit test|integration test|coverage|e2e)"; then
+        score_testing=$((score_testing + 4))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(tests pass|test pass|passed|\\bpass\\b)"; then
+        score_testing=$((score_testing + 1))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(测试|单测|用例|回归|覆盖率|集成测试|端到端)"; then
+        score_testing=$((score_testing + 3))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(apply_patch|git diff|git status|create file|created file|update file|writing|implemented|implementing)"; then
+        score_coding=$((score_coding + 3))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(function|class|def |public |private |interface |type |struct )"; then
+        score_coding=$((score_coding + 1))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(实现|编码|写代码|新增|添加功能|修复代码)"; then
+        score_coding=$((score_coding + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(refactor|optimi|cleanup|polish|format|lint|prettier|gofmt|ruff|eslint|black)"; then
+        score_refining=$((score_refining + 3))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(重构|优化|整理|格式化|静态检查)"; then
+        score_refining=$((score_refining + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(plan|todo|design|spec|architecture|requirement|explain this codebase)"; then
+        score_planning=$((score_planning + 2))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(计划|设计|需求|架构|方案|拆分)"; then
+        score_planning=$((score_planning + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(readme|documentation|docs|guide|changelog)"; then
+        score_documenting=$((score_documenting + 2))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(文档|说明|使用方法|指南|更新日志)"; then
+        score_documenting=$((score_documenting + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(deploy|release|publish|ship|delivery)"; then
+        score_release=$((score_release + 2))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(上线|发布|提测|发版)"; then
+        score_release=$((score_release + 2))
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(done|complete|all tasks completed|ready to ship|finalized)"; then
+        score_done=$((score_done + 2))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(已完成|完成|结束|收尾)"; then
+        score_done=$((score_done + 2))
+    fi
+
+    # reviewing: 代码审查阶段
+    if printf "%s" "$text_lower" | grep -qE "(review|pr|pull request|merge request|code review|审查|评审|cr)"; then
+        score_reviewing=$((score_reviewing + 3))
+    fi
+    if printf "%s" "$text_lower" | grep -qE "(lgtm|approve|approved|request changes)"; then
+        score_reviewing=$((score_reviewing + 2))
+    fi
+
+    local best_stage="unknown"
+    local best_score=0
+    local second_score=0
+
+    local stage score
+    for stage in blocked fixing testing coding refining planning documenting release done reviewing waiting; do
+        score=0
+        case "$stage" in
+            blocked) score="$score_blocked" ;;
+            fixing) score="$score_fixing" ;;
+            testing) score="$score_testing" ;;
+            coding) score="$score_coding" ;;
+            refining) score="$score_refining" ;;
+            planning) score="$score_planning" ;;
+            documenting) score="$score_documenting" ;;
+            release) score="$score_release" ;;
+            done) score="$score_done" ;;
+            reviewing) score="$score_reviewing" ;;
+            waiting) score="$score_waiting" ;;
+        esac
+
+        if [ "$score" -gt "$best_score" ]; then
+            second_score="$best_score"
+            best_score="$score"
+            best_stage="$stage"
+        elif [ "$score" -gt "$second_score" ]; then
+            second_score="$score"
+        fi
+    done
+
+    if [ "$best_score" -lt "$STAGE_SCORE_THRESHOLD" ]; then
+        best_stage="unknown"
+    elif [ $((best_score - second_score)) -lt "$STAGE_SCORE_MARGIN" ]; then
+        best_stage="unknown"
+    fi
+
+    printf "%s\t%s\n" "$best_stage" "$best_score"
+}
+
+is_valid_stage_label() {
+    case "${1:-}" in
+        planning|coding|testing|fixing|refining|reviewing|documenting|release|done|blocked|waiting|unknown) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+parse_llm_structured_output() {
+    local raw="${1:-}"
+    raw="$(printf "%s" "$raw" | head -1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    LLM_STAGE_HINT=""
+
+    if [ -z "$raw" ]; then
+        echo "WAIT"
+        return 0
+    fi
+    if [ "$raw" = "WAIT" ]; then
+        echo "WAIT"
+        return 0
+    fi
+
+    local stage_hint=""
+    local cmd=""
+    local re='^[Ss][Tt][Aa][Gg][Ee][=:][[:space:]]*([a-z-]+)[[:space:]]*;[[:space:]]*[Cc][Mm][Dd][=:][[:space:]]*(.*)$'
+    if [[ "$raw" =~ $re ]]; then
+        stage_hint="$(printf "%s" "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+        cmd="${BASH_REMATCH[2]}"
+        cmd="$(printf "%s" "$cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        if is_valid_stage_label "$stage_hint"; then
+            LLM_STAGE_HINT="$stage_hint"
+        fi
+        if [ -z "$cmd" ]; then
+            cmd="WAIT"
+        fi
+        echo "$cmd"
+        return 0
+    fi
+
+    echo "$raw"
+}
+
+apply_stage_hint_if_needed() {
+    local now_s="${1:-0}"
+    local hint="${2:-}"
+
+    hint="$(printf "%s" "$hint" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$hint" ] || ! is_valid_stage_label "$hint" || [ "$hint" = "unknown" ]; then
+        STAGE_HINT_LAST=""
+        STAGE_HINT_STABLE_COUNT=0
+        return 0
+    fi
+
+    if [ "${LAST_STAGE_DETECTED:-unknown}" != "unknown" ]; then
+        STAGE_HINT_LAST=""
+        STAGE_HINT_STABLE_COUNT=0
+        return 0
+    fi
+
+    if [ "$hint" = "$STAGE_HINT_LAST" ]; then
+        STAGE_HINT_STABLE_COUNT=$((STAGE_HINT_STABLE_COUNT + 1))
+    else
+        STAGE_HINT_LAST="$hint"
+        STAGE_HINT_STABLE_COUNT=1
+    fi
+
+    if [ "$STAGE_HINT_STABLE_COUNT" -lt "$STAGE_HINT_STABLE_REQUIRED" ]; then
+        return 0
+    fi
+    if [ "$STAGE_HINT_LAST_APPLIED_AT" -ne 0 ] && [ $((now_s - STAGE_HINT_LAST_APPLIED_AT)) -lt "$STAGE_HINT_COOLDOWN_S" ]; then
+        return 0
+    fi
+
+    if [ "$CURRENT_STAGE" != "$hint" ]; then
+        CURRENT_STAGE="$hint"
+        append_stage_history "$CURRENT_STAGE"
+        STAGE_HINT_LAST_APPLIED_AT="$now_s"
+        log "🧭 采用 LLM 阶段建议 -> $CURRENT_STAGE"
+    fi
 }
 
 auto_role_candidate_for_stage() {
@@ -341,8 +551,9 @@ auto_role_candidate_for_stage() {
         testing) echo "test-manager" ;;
         planning) echo "architect" ;;
         coding|refining) echo "senior-engineer" ;;
+        reviewing) echo "senior-engineer" ;;
         documenting) echo "monitor" ;;
-        release|done|blocked) echo "monitor" ;;
+        release|done|blocked|waiting) echo "monitor" ;;
         *) echo "monitor" ;;
     esac
 }
@@ -380,13 +591,19 @@ choose_effective_role() {
 }
 
 update_stage_tracker() {
-    local detected_stage
-    detected_stage="$(detect_stage_from_output "$1")"
+    local detected_stage detected_score
+    local score_line
+    score_line="$(score_stage_from_output "$1")"
+    IFS=$'\t' read -r detected_stage detected_score <<< "$score_line"
+
+    LAST_STAGE_DETECTED="${detected_stage:-unknown}"
+    LAST_STAGE_SCORE="${detected_score:-0}"
+
     if [ -z "$detected_stage" ] || [ "$detected_stage" = "unknown" ]; then
-        LAST_DETECTED_STAGE="unknown"
-        STAGE_STABLE_COUNT=0
+        UNKNOWN_STAGE_STREAK=$((UNKNOWN_STAGE_STREAK + 1))
         return
     fi
+    UNKNOWN_STAGE_STREAK=0
 
     if [ "$detected_stage" = "$LAST_DETECTED_STAGE" ]; then
         STAGE_STABLE_COUNT=$((STAGE_STABLE_COUNT + 1))
@@ -488,24 +705,48 @@ decide_response_llm() {
     if [ -n "$STAGE_HISTORY" ]; then
         meta_block+="[monitor-meta] stage_history: ${STAGE_HISTORY}"$'\n'
     fi
+
+    # 主动采集项目上下文（增强主观能动性）
+    local project_context_script="${script_dir}/project_context.sh"
+    if [ -f "$project_context_script" ] && [ "${AI_MONITOR_ENABLE_PROJECT_CONTEXT:-1}" = "1" ]; then
+        local pane_cwd
+        pane_cwd="$(tmux display-message -p -t "$TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE" '#{pane_current_path}' 2>/dev/null || echo "")"
+        if [ -n "$pane_cwd" ] && [ -d "$pane_cwd" ]; then
+            local project_ctx
+            project_ctx="$(bash "$project_context_script" "$pane_cwd" 2>/dev/null | head -20)"
+            if [ -n "$project_ctx" ]; then
+                meta_block+=$'\n'"${project_ctx}"$'\n'
+                log "📊 项目上下文已采集 (cwd=$pane_cwd)"
+            fi
+        else
+            log "⚠️  无法获取面板工作目录，跳过项目上下文采集"
+        fi
+    fi
+
     if [ -n "$meta_block" ]; then
         llm_input="${llm_input}"$'\n\n'"${meta_block}"
     fi
 
-    local response
+    local response raw_response
     if [ -n "$LLM_API_KEY" ]; then
         response=$(AI_MONITOR_LLM_API_KEY="$LLM_API_KEY" python3 "$llm_script" "${llm_args[@]}" 2>>"$LOG_FILE" <<<"$llm_input") || response=""
     else
         response=$(python3 "$llm_script" "${llm_args[@]}" 2>>"$LOG_FILE" <<<"$llm_input") || response=""
     fi
 
-    response=$(echo "$response" | head -1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    if [ -z "$response" ]; then
+    raw_response=$(echo "$response" | head -1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$raw_response" ]; then
         log "⚠️  LLM 调用失败或返回空内容，本轮不发送"
-        response="WAIT"
+        raw_response="WAIT"
     fi
+
+    response="$(parse_llm_structured_output "$raw_response")"
     log " "
-    log "✨ LLM 输出: $response"
+    if [ -n "${LLM_STAGE_HINT:-}" ]; then
+        log "✨ LLM 输出: ${raw_response}  (stage_hint=${LLM_STAGE_HINT})"
+    else
+        log "✨ LLM 输出: $raw_response"
+    fi
     if [ "$response" = "WAIT" ]; then
         log "⏸️ LLM 回复 WAIT，本轮不发送命令"
     fi
@@ -610,6 +851,9 @@ while true; do
 
             response=$(decide_response_llm "$current_output" "$last_response" "$same_response_count" "$idle_duration" "$current_time")
             response="$(validate_response "$response")"
+            if [ -n "${LLM_STAGE_HINT:-}" ]; then
+                apply_stage_hint_if_needed "$current_time" "$LLM_STAGE_HINT"
+            fi
             if [ -n "$current_output_hash" ]; then
                 last_llm_output_hash="$current_output_hash"
                 last_llm_output_hash_time=$current_time
@@ -618,22 +862,21 @@ while true; do
 
             # 检查是否需要等待
             if [ "$response" != "WAIT" ]; then
-                # 防止重复发送相同回复
+                # 防止重复发送相同回复（避免在无变化的交互界面里“刷屏/连发”）
                 if [ "$response" = "$last_response" ]; then
                     ((same_response_count++))
+                    if [ $same_response_count -ge $MAX_RETRY_SAME ]; then
+                        log "⚠️  LLM 连续给出相同回复 ${same_response_count} 次，已停止重复发送，建议人工介入或调整提示词/阈值"
+                    else
+                        log "⏭️ 与上次发送相同，已跳过重复发送: '$response'"
+                    fi
                 else
                     same_response_count=0
+                    log "🔄 空闲 ${idle_duration}秒，LLM 回复: '$response'"
+                    send_command "$response"
+                    last_response="$response"
+                    LAST_RESPONSE_SENT_AT="$current_time"
                 fi
-
-                if [ $same_response_count -ge $MAX_RETRY_SAME ]; then
-                    log "⚠️  相同回复已连续发送 ${same_response_count} 次，建议人工介入或调整提示词/阈值"
-                fi
-
-                log "🔄 空闲 ${idle_duration}秒，LLM 回复: '$response'"
-                send_command "$response"
-
-                last_response="$response"
-                LAST_RESPONSE_SENT_AT="$current_time"
             fi
         else
             :

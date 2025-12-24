@@ -20,6 +20,7 @@ _FALLBACK_PROMPT = u"""你是一个“AI 监工/督导”，负责监管 Codex�
 
 输出要求（非常重要）：
 1) 只能输出一行纯文本，不要 Markdown、不要代码块、不要多余解释。
+1.1) 推荐结构化输出（单行）：STAGE=<planning|coding|testing|fixing|refining|reviewing|documenting|release|done|blocked|waiting|unknown>; CMD=<WAIT 或可执行命令>。
 2) 如果当前 AI 仍在执行、等待更多上下文、或者你并不确定下一步，输出：WAIT。
 3) 遇到危险/破坏性操作（delete/remove/reset/drop/overwrite/force 等）必须输出：WAIT。
 4) 若发现错误/失败/异常，请给出一句简洁指令，提醒它诊断并修复。
@@ -70,6 +71,7 @@ def _compose_auto_prompt():
 2) 如果任务仍在执行、上下文不足或需要更多信息，请输出 WAIT；
 3) 严禁输出空泛的 continue/keep going，除非日志明确让你输入 continue；
 4) 检测到危险操作（delete/remove/reset/drop/overwrite/force 等）时，必须返回 WAIT。
+5) 推荐结构化输出（单行）：STAGE=<planning|coding|testing|fixing|refining|reviewing|documenting|release|done|blocked|waiting|unknown>; CMD=<WAIT 或可执行命令>。
 
 附加上下文：
 - 你会看到若干 `[monitor-meta] key: value` 行，其中包含 `stage / stage_history / last_response / same_response_count`；
