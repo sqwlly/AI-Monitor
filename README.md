@@ -5,8 +5,8 @@
 ## 功能
 
 - **LLM 监工**：把最近输出交给另一个模型（OpenAI 兼容接口）生成“单行回复”，并发送回目标面板
-- **多角色提示词**：内置 `monitor / architect / ui-designer / algo-engineer / senior-engineer / test-manager`，并支持 `--role auto` 让 LLM 自行挑选合适 persona 推进任务
-- **研发阶段感知**：实时解析面板输出得到 `planning / coding / testing / release / done / fixing` 等阶段，并通过 `[monitor-meta] stage*` 提供给 LLM，auto 角色会据此判断是否继续推进、切换角色或暂停
+- **多角色提示词**：内置 `monitor / architect / ui-designer / game-designer / algo-engineer / senior-engineer / test-manager`，并支持 `--role auto` 由脚本根据阶段自动选角（更可预测、可回放）
+- **研发阶段感知**：实时解析面板输出得到 `planning / coding / testing / release / done / fixing` 等阶段，并通过 `[monitor-meta] stage*` 提供给 LLM；auto 模式会基于阶段稳定切换 persona 或暂停
 - **支持千问（Qwen）**：可用本地 Ollama（OpenAI 兼容接口）运行 `qwen2.5*` 作为监工模型
 - **安全默认**：检测到“进行中/危险确认”时输出 `WAIT`，避免自动确认破坏性操作
 
@@ -24,7 +24,7 @@
 ./claude-monitor list
 ```
 
-`cm list` 的输出会在每个会话下方附带 `tmux attach -t <session>`，方便你随时进入对应的 tmux 会话。
+`cm list` 的输出会在每个会话下方附带 `tmux attach -t <session>`，方便你随时进入对应的 tmux 会话；在交互终端下还可直接按编号选择面板并启动监控。
 
 2) 启动 LLM 监工监控：
 
@@ -137,21 +137,28 @@ cm "2:mon.0"
 1. `monitor`：默认的监工，保持任务推进并避免危险操作。
 2. `architect`：软件架构师，专注模块划分、技术选型与骨架搭建。
 3. `ui-designer`：产品/UI 设计师，输出交互线框、视觉规范与资产需求。
-4. `algo-engineer`：算法工程师，聚焦算法实现、性能优化与验证。
-5. `senior-engineer`：高级软件开发工程师，统筹编码、调试、性能与质量管控，适合通用研发推进。
-6. `test-manager`：测试经理 / 质量负责人，负责安排自动化测试、回归验证、缺陷复现与质量评估。
-`auto`：特殊模式，LLM 会在上述角色中自行挑选最合适的一位并以其视角作答。
+4. `game-designer`：游戏策划 / 系统设计师（硬核玩家视角），聚焦玩法循环、数值与玩家体验。
+5. `algo-engineer`：算法工程师，聚焦算法实现、性能优化与验证。
+6. `senior-engineer`：高级软件开发工程师，统筹编码、调试、性能与质量管控，适合通用研发推进。
+7. `test-manager`：测试经理 / 质量负责人，负责安排自动化测试、回归验证、缺陷复现与质量评估。
+`auto`：特殊模式，由脚本根据 `stage/stage_history` 自动选择合适 persona（并带“稳定/冷却”策略防抖）。
+
+默认映射（可按需调整脚本逻辑）：
+- `fixing` / `coding` / `refining` -> `senior-engineer`
+- `testing` -> `test-manager`
+- `planning` -> `architect`
+- 其他阶段 -> `monitor`
 
 示例：
 
 ```bash
 cm "5:node.0" --role architect
 export AI_MONITOR_LLM_ROLE="ui-designer"   # 设置默认角色
-cm "0:node.0" --role auto                  # 让 LLM 自动挑选角色
+cm "0:node.0" --role auto                  # 由脚本按阶段自动选角
 cm "2:mon.0" --role test-manager           # 专注测试/质量任务
 ```
 
-当启用 `auto` 时，脚本会把 `[monitor-meta] stage` 与 `stage_history` 注入到提示词里，帮助 LLM 判断当前研发阶段（planning/coding/testing/release/done 等）与推进程度，从而自动决定继续开发、切换职责或输出 `WAIT`。
+当启用 `auto` 时，脚本会基于面板输出推断 `stage` 并自动切换 persona，同时把 `[monitor-meta] stage` 与 `stage_history` 注入提示词，帮助 LLM 更稳地判断推进/测试/暂停（`WAIT`）。
 使用 `cm run <target>` 且未指定角色时，CLI 会先弹出角色选择列表（默认 `auto`），便于随手切换语气。
 
 提示词位于 `prompts/<role>.txt`，可按需修改或新增同名文件来自定义 persona。
@@ -163,7 +170,9 @@ cm "2:mon.0" --role test-manager           # 专注测试/质量任务
 - `AI_MONITOR_LLM_BASE_URL`
 - `AI_MONITOR_LLM_API_KEY`
 - `AI_MONITOR_LLM_MODEL`
-- `AI_MONITOR_LLM_ROLE`（可填 `auto` 让监工模型从内置 persona 中自行择优）
+- `AI_MONITOR_LLM_ROLE`（可填 `auto` 启用脚本自动选角）
+- `AI_MONITOR_AUTO_ROLE_COOLDOWN_S`：auto 选角切换冷却时间（秒），默认 `60`
+- `AI_MONITOR_AUTO_ROLE_STABLE_COUNT`：阶段稳定计数阈值（连续检测到同一 stage 的次数），默认 `2`
 - `DASHSCOPE_API_KEY`（可选：用于云端千问，且可触发默认 base-url）
 - `AI_MONITOR_LLM_TIMEOUT`
 - `AI_MONITOR_LLM_MAX_TOKENS`
@@ -173,6 +182,10 @@ cm "2:mon.0" --role test-manager           # 专注测试/质量任务
 日志控制（可选）：
 
 - `AI_MONITOR_LOG_MAX_BYTES`：单个日志文件最大字节数，默认 `10485760`（10MB），超过则截断保留末尾
+
+LLM 调用控制（可选）：
+
+- `AI_MONITOR_LLM_REQUERY_SAME_OUTPUT_AFTER`：同一“面板输出快照”允许再次请求 LLM 的最小间隔（秒）；默认 `0` 表示只要面板输出没变化就不重复请求（避免空闲时反复打 LLM）。
 
 提示词控制（避免“一直 continue”）：
 

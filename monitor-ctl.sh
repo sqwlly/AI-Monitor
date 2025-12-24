@@ -6,6 +6,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SMART_SCRIPT="${SCRIPT_DIR}/smart-monitor.sh"
+PROMPTS_DIR="${SCRIPT_DIR}/prompts"
+ROLES_MANIFEST="${PROMPTS_DIR}/roles.json"
 LOG_DIR="$HOME/.tmux-monitor"
 CMD="${CLAUDE_MONITOR_CMD:-$(basename "$0")}"
 
@@ -16,7 +18,57 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-ROLE_CHOICES=("auto" "monitor" "senior-engineer" "test-manager" "architect" "ui-designer" "algo-engineer")
+ROLE_CHOICES=()
+ROLE_DESCS=()
+
+hash_text() {
+    local input="${1:-}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf "%s" "$input" | sha256sum | awk '{print $1}'
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        printf "%s" "$input" | shasum -a 256 | awk '{print $1}'
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$input" <<'PY'
+import hashlib
+import sys
+data = sys.argv[1].encode("utf-8", "replace")
+print(hashlib.sha256(data).hexdigest())
+PY
+        return 0
+    fi
+    if command -v cksum >/dev/null 2>&1; then
+        printf "%s" "$input" | cksum | awk '{print $1}'
+        return 0
+    fi
+    return 1
+}
+
+resolve_target_id() {
+    local target="${1:-}"
+    local pane_id=""
+
+    pane_id="$(tmux display-message -p -t "$target" "#{pane_id}" 2>/dev/null || true)"
+    pane_id="${pane_id#%}"
+    if [ -n "$pane_id" ]; then
+        hash_text "$pane_id"
+        return $?
+    fi
+
+    hash_text "$target"
+}
+
+read_pid_meta() {
+    local pid_file="$1"
+    local key="$2"
+    local line
+
+    line="$(grep -E "^${key}=" "$pid_file" 2>/dev/null | head -n 1 || true)"
+    printf "%s" "${line#*=}"
+}
 
 role_choice_description() {
     case "$1" in
@@ -26,12 +78,51 @@ role_choice_description() {
         test-manager) echo "测试经理，侧重验证与风控" ;;
         architect) echo "架构师，负责拆分设计" ;;
         ui-designer) echo "产品/UI 设计师" ;;
+        game-designer) echo "游戏策划/系统设计师（硬核玩家视角）" ;;
         algo-engineer) echo "算法工程师" ;;
         *) echo "" ;;
     esac
 }
 
+load_role_choices() {
+    ROLE_CHOICES=("auto")
+    ROLE_DESCS=("自动择优（根据阶段切换角色）")
+
+    if [ -f "$ROLES_MANIFEST" ] && command -v python3 >/dev/null 2>&1; then
+        local line role desc
+        while IFS=$'\t' read -r role desc; do
+            if [ -n "$role" ]; then
+                ROLE_CHOICES+=("$role")
+                ROLE_DESCS+=("$desc")
+            fi
+        done < <(python3 - "$ROLES_MANIFEST" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f) or {}
+
+for role, desc in data.items():
+    role = (role or "").strip()
+    desc = (desc or "").strip()
+    if role:
+        sys.stdout.write(f"{role}\t{desc}\n")
+PY
+)
+        if [ "${#ROLE_CHOICES[@]}" -gt 1 ]; then
+            return 0
+        fi
+    fi
+
+    ROLE_CHOICES=("auto" "monitor" "senior-engineer" "test-manager" "architect" "ui-designer" "game-designer" "algo-engineer")
+    ROLE_DESCS=("自动择优（根据阶段切换角色）" "默认监工，偏保守" "高级研发，主动推进编码/调试" "测试经理，侧重验证与风控" "架构师，负责拆分设计" "产品/UI 设计师" "游戏策划/系统设计师（硬核玩家视角）" "算法工程师")
+    return 0
+}
+
 prompt_role_choice() {
+    load_role_choices
+
     local default_role="${AI_MONITOR_LLM_ROLE:-auto}"
     local total="${#ROLE_CHOICES[@]}"
 
@@ -40,7 +131,10 @@ prompt_role_choice() {
     local index=1
     for role in "${ROLE_CHOICES[@]}"; do
         local desc
-        desc="$(role_choice_description "$role")"
+        desc="${ROLE_DESCS[$((index - 1))]}"
+        if [ -z "$desc" ]; then
+            desc="$(role_choice_description "$role")"
+        fi
         local marker=""
         if [ "$role" = "$default_role" ]; then
             marker="(默认)"
@@ -83,7 +177,7 @@ show_help() {
   stop [target]         - 停止监控（不指定则停止所有）
   restart <target> [opts] - 重启监控
   status                - 查看所有运行中的监控
-  list                  - 列出所有 tmux 会话和面板
+  list                  - 列出所有 tmux 会话和面板（TTY 下可交互选择并启动监控）
   logs [target]         - 查看日志
   tail [target]         - 实时查看日志
   clean                 - 清理旧日志
@@ -161,38 +255,85 @@ list_tmux_panes() {
     fi
     
     echo ""
-    tmux list-sessions -F "#{session_name}" 2>/dev/null | while read session; do
+    local -a pane_targets=()
+    local -a pane_labels=()
+
+    while IFS= read -r session; do
         echo -e "${GREEN}会话: $session${NC}"
         echo "  进入命令: tmux attach -t $session"
-        tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null | while read window; do
-            window_index=$(echo $window | cut -d: -f1)
-            window_name=$(echo $window | cut -d: -f2)
+
+        while IFS= read -r window; do
+            local window_index="${window%%:*}"
+            local window_name="${window#*:}"
             echo -e "  ${BLUE}窗口: $window_name ($window_index)${NC}"
             
-            tmux list-panes -t "$session:$window_index" -F "#{pane_index}: #{pane_current_command}" 2>/dev/null | while read pane; do
-                pane_index=$(echo $pane | cut -d: -f1)
-                pane_cmd=$(echo $pane | cut -d: -f2-)
+            while IFS= read -r pane; do
+                local pane_index="${pane%%:*}"
+                local pane_cmd="${pane#*: }"
+                local target="${session}:${window_name}.${pane_index}"
+
+                pane_targets+=("$target")
+                pane_labels+=("${target}  ${pane_cmd}")
                 
                 # 高亮显示可能是 Claude Code 的面板
                 if echo "$pane_cmd" | grep -qi "claude"; then
                     echo -e "    ${YELLOW}→ 面板 $pane_index: $pane_cmd ⭐${NC}"
-                    echo -e "      ${YELLOW}监控命令: ${CMD} ${session}:${window_name}.${pane_index}${NC}"
+                    echo -e "      ${YELLOW}监控命令: ${CMD} \"${target}\"${NC}"
                 else
                     echo "    → 面板 $pane_index: $pane_cmd"
-                    echo "      监控命令: ${CMD} ${session}:${window_name}.${pane_index}"
+                    echo "      监控命令: ${CMD} \"${target}\""
                 fi
-            done
-        done
+                if [ -z "${AI_MONITOR_LLM_ROLE:-}" ]; then
+                    echo "      角色选择: 启动后可在提示中挑选 persona（默认 auto）"
+                fi
+            done < <(tmux list-panes -t "$session:$window_index" -F "#{pane_index}: #{pane_current_command}" 2>/dev/null || true)
+        done < <(tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null || true)
         echo ""
-    done
+    done < <(tmux list-sessions -F "#{session_name}" 2>/dev/null || true)
+
+    # 交互式选择（仅在 TTY 且 stdout 为终端时启用；避免影响脚本/管道场景）
+    if [ -t 0 ] && [ -t 1 ] && [ "${#pane_targets[@]}" -gt 0 ]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "选择要启动监控的面板（回车退出）："
+        local idx=1
+        while [ "$idx" -le "${#pane_targets[@]}" ]; do
+            printf "  %2d) %s\n" "$idx" "${pane_labels[$((idx - 1))]}"
+            idx=$((idx + 1))
+        done
+        echo -n "输入编号或 target: "
+        local selection
+        read -r selection
+
+        if [ -z "$selection" ]; then
+            return
+        fi
+
+        local chosen_target=""
+        if [[ "$selection" =~ ^[0-9]+$ ]]; then
+            if [ "$selection" -ge 1 ] && [ "$selection" -le "${#pane_targets[@]}" ]; then
+                chosen_target="${pane_targets[$((selection - 1))]}"
+            fi
+        elif is_target "$selection"; then
+            chosen_target="$selection"
+        fi
+
+        if [ -z "$chosen_target" ]; then
+            echo -e "${YELLOW}无效选择，已退出。${NC}"
+            return
+        fi
+
+        start_llm_monitor "$chosen_target"
+    fi
 }
 
 start_llm_monitor() {
     local target="$1"
+    local prompted_target=0
 
     if [ -z "$target" ]; then
         if [ -t 0 ]; then
             target="$(prompt_target)"
+            prompted_target=1
         else
             echo -e "${RED}错误: 请指定要监控的面板${NC}"
             echo "使用 '${CMD} list' 查看可用面板"
@@ -209,13 +350,16 @@ start_llm_monitor() {
 
     # 解析目标
     if [[ $target =~ ^([^:]+):([^.]+)\.([0-9]+)$ ]]; then
-        session="${BASH_REMATCH[1]}"
-        window="${BASH_REMATCH[2]}"
-        pane="${BASH_REMATCH[3]}"
-        pid_file="$LOG_DIR/smart_${session}_${window}_${pane}.pid"
+        local target_id
+        target_id="$(resolve_target_id "$target" 2>/dev/null || true)"
+        if [ -z "$target_id" ]; then
+            echo -e "${RED}错误: 无法生成 target ID（缺少哈希工具）${NC}"
+            exit 1
+        fi
+        pid_file="$LOG_DIR/smart_${target_id}.pid"
 
         if [ -f "$pid_file" ]; then
-            pid=$(cat "$pid_file")
+            pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
             if ps -p $pid > /dev/null 2>&1; then
                 echo -e "${YELLOW}该面板已在 LLM 监工监控中 (PID: $pid)${NC}"
                 return
@@ -245,7 +389,7 @@ start_llm_monitor() {
         if [ $has_explicit_role -eq 0 ]; then
             if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
                 configured_role="${AI_MONITOR_LLM_ROLE}"
-            elif [ -t 0 ]; then
+            elif [ -t 0 ] && [ $prompted_target -eq 1 ]; then
                 local chosen_role
                 chosen_role="$(prompt_role_choice)"
                 if [ -z "$chosen_role" ]; then
@@ -268,7 +412,7 @@ start_llm_monitor() {
         if [ -n "$configured_role" ]; then
             echo "  角色: $configured_role"
         fi
-        echo "  日志: $LOG_DIR/smart_${session}_${window}_${pane}.log"
+        echo "  日志: $LOG_DIR/smart_${target_id}.log"
         echo ""
         echo "使用 '${CMD} tail $target' 实时查看日志"
     else
@@ -288,7 +432,7 @@ stop_monitor() {
         if [ -d "$LOG_DIR" ]; then
             for pid_file in "$LOG_DIR"/*.pid; do
                 if [ -f "$pid_file" ]; then
-                    pid=$(cat "$pid_file")
+                    pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
                     if ps -p $pid > /dev/null 2>&1; then
                         kill $pid
                         echo -e "${GREEN}✓ 已停止 $(basename ${pid_file%.pid})${NC}"
@@ -314,7 +458,7 @@ stop_monitor() {
             # 旧版本：monitor_*.pid（已废弃，但仍尝试停止）
             pid_file="$LOG_DIR/monitor_${session}_${window}_${pane}.pid"
             if [ -f "$pid_file" ]; then
-                pid=$(cat "$pid_file")
+                pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
                 if ps -p $pid > /dev/null 2>&1; then
                     kill $pid
                     echo -e "${GREEN}✓ 已停止旧版本监控 $target${NC}"
@@ -323,16 +467,32 @@ stop_monitor() {
                 rm -f "$pid_file"
             fi
 
-            # 当前：smart_*.pid（LLM 监工）
-            smart_pid_file="$LOG_DIR/smart_${session}_${window}_${pane}.pid"
-            if [ -f "$smart_pid_file" ]; then
-                pid=$(cat "$smart_pid_file")
+            # 当前：smart_<hash>.pid（LLM 监工）
+            local target_id=""
+            target_id="$(resolve_target_id "$target" 2>/dev/null || true)"
+            if [ -n "$target_id" ]; then
+                smart_pid_file="$LOG_DIR/smart_${target_id}.pid"
+                if [ -f "$smart_pid_file" ]; then
+                    pid="$(head -n 1 "$smart_pid_file" 2>/dev/null || true)"
+                    if ps -p $pid > /dev/null 2>&1; then
+                        kill $pid
+                        echo -e "${GREEN}✓ 已停止 LLM 监工监控 $target${NC}"
+                        stopped=1
+                    fi
+                    rm -f "$smart_pid_file"
+                fi
+            fi
+
+            # 兼容旧 smart pid 文件名：smart_${session}_${window}_${pane}.pid
+            local legacy_smart_pid_file="$LOG_DIR/smart_${session}_${window}_${pane}.pid"
+            if [ -f "$legacy_smart_pid_file" ]; then
+                pid="$(head -n 1 "$legacy_smart_pid_file" 2>/dev/null || true)"
                 if ps -p $pid > /dev/null 2>&1; then
                     kill $pid
-                    echo -e "${GREEN}✓ 已停止 LLM 监工监控 $target${NC}"
+                    echo -e "${GREEN}✓ 已停止旧命名 LLM 监工监控 $target${NC}"
                     stopped=1
                 fi
-                rm -f "$smart_pid_file"
+                rm -f "$legacy_smart_pid_file"
             fi
 
             if [ $stopped -eq 0 ]; then
@@ -358,39 +518,53 @@ show_status() {
     for pid_file in "$LOG_DIR"/*.pid; do
         if [ -f "$pid_file" ]; then
             filename=$(basename "$pid_file" .pid)
-            # 解析文件名: smart_session_window_pane 或旧版本 monitor_session_window_pane
-            if [[ $filename =~ ^(smart|monitor)_(.+)_(.+)_([0-9]+)$ ]]; then
-                mode="${BASH_REMATCH[1]}"
+            pid="$(head -n 1 "$pid_file" 2>/dev/null || true)"
+            if [ -z "$pid" ]; then
+                continue
+            fi
+
+            mode="$(read_pid_meta "$pid_file" "mode")"
+            if [ -z "$mode" ]; then
+                if [[ $filename =~ ^(smart|monitor)_ ]]; then
+                    mode="${BASH_REMATCH[1]}"
+                else
+                    mode="unknown"
+                fi
+            fi
+
+            target="$(read_pid_meta "$pid_file" "target")"
+            if [ -z "$target" ] && [[ $filename =~ ^(smart|monitor)_(.+)_(.+)_([0-9]+)$ ]]; then
                 session="${BASH_REMATCH[2]}"
                 window="${BASH_REMATCH[3]}"
                 pane="${BASH_REMATCH[4]}"
                 target="$session:$window.$pane"
+            fi
+            if [ -z "$target" ]; then
+                target="(unknown)"
+            fi
 
-                pid=$(cat "$pid_file")
-                if ps -p $pid > /dev/null 2>&1; then
-                    log_file="${pid_file%.pid}.log"
+            if ps -p $pid > /dev/null 2>&1; then
+                log_file="${pid_file%.pid}.log"
 
-                    if [ "$mode" = "smart" ]; then
-                        echo -e "${GREEN}✓ 运行中${NC} 🧠 - $target ${BLUE}[LLM 监工]${NC}"
-                    else
-                        echo -e "${YELLOW}✓ 运行中${NC} - $target [旧版本监控：建议 stop]${NC}"
-                    fi
-                    echo "  PID: $pid"
-                    echo "  日志: $log_file"
-                    if [ -f "$log_file" ]; then
-                        echo "  大小: $(du -h "$log_file" | cut -f1)"
-                        # 显示最后一行日志
-                        last_log=$(tail -1 "$log_file" 2>/dev/null)
-                        if [ -n "$last_log" ]; then
-                            echo "  最后: $last_log"
-                        fi
-                    fi
-                    echo ""
+                if [ "$mode" = "smart" ]; then
+                    echo -e "${GREEN}✓ 运行中${NC} 🧠 - $target ${BLUE}[LLM 监工]${NC}"
                 else
-                    echo -e "${RED}✗ 已停止${NC} - $target (陈旧的 PID: $pid)"
-                    rm -f "$pid_file"
-                    echo ""
+                    echo -e "${YELLOW}✓ 运行中${NC} - $target [旧版本/未知模式]${NC}"
                 fi
+                echo "  PID: $pid"
+                echo "  日志: $log_file"
+                if [ -f "$log_file" ]; then
+                    echo "  大小: $(du -h "$log_file" | cut -f1)"
+                    last_log=$(tail -1 "$log_file" 2>/dev/null)
+                    if [ -n "$last_log" ]; then
+                        echo "  最后: $last_log"
+                    fi
+                fi
+                echo ""
+            else
+                echo -e "${RED}✗ 已停止${NC} - $target (陈旧的 PID: $pid)"
+                rm -f "$pid_file"
+                echo ""
             fi
         fi
     done
@@ -423,11 +597,15 @@ show_logs() {
             session="${BASH_REMATCH[1]}"
             window="${BASH_REMATCH[2]}"
             pane="${BASH_REMATCH[3]}"
-            smart_log="$LOG_DIR/smart_${session}_${window}_${pane}.log"
+            target_id="$(resolve_target_id "$target" 2>/dev/null || true)"
+            smart_log="$LOG_DIR/smart_${target_id}.log"
             legacy_log="$LOG_DIR/monitor_${session}_${window}_${pane}.log"
+            legacy_smart_log="$LOG_DIR/smart_${session}_${window}_${pane}.log"
 
-            if [ -f "$smart_log" ]; then
+            if [ -n "$target_id" ] && [ -f "$smart_log" ]; then
                 log_file="$smart_log"
+            elif [ -f "$legacy_smart_log" ]; then
+                log_file="$legacy_smart_log"
             else
                 log_file="$legacy_log"
             fi
@@ -461,11 +639,15 @@ tail_logs() {
             pane="${BASH_REMATCH[3]}"
 
             # 优先查找当前日志，其次旧版本日志
-            smart_log="$LOG_DIR/smart_${session}_${window}_${pane}.log"
+            target_id="$(resolve_target_id "$target" 2>/dev/null || true)"
+            smart_log="$LOG_DIR/smart_${target_id}.log"
             normal_log="$LOG_DIR/monitor_${session}_${window}_${pane}.log"
+            legacy_smart_log="$LOG_DIR/smart_${session}_${window}_${pane}.log"
 
-            if [ -f "$smart_log" ]; then
+            if [ -n "$target_id" ] && [ -f "$smart_log" ]; then
                 log_file="$smart_log"
+            elif [ -f "$legacy_smart_log" ]; then
+                log_file="$legacy_smart_log"
             elif [ -f "$normal_log" ]; then
                 log_file="$normal_log"
             else
