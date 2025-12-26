@@ -6,6 +6,7 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -14,9 +15,9 @@ import urllib.request
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 ROLES_MANIFEST = os.path.join(PROMPTS_DIR, "roles.json")
 DEFAULT_ROLE = "monitor"
-_FALLBACK_PROMPT = u"""你是一个“AI 监工/督导”，负责监管 Codex、Claude Code 等开发环境，确保它们在 tmux 面板里持续推进任务。
+_FALLBACK_PROMPT = u"""你是一个"AI 监工/督导"，负责监管 Codex、Claude Code 等开发环境，确保它们在 tmux 面板里持续推进任务。
 
-请根据近期输出（多行文本）决定是否要发送“一条单行命令”。你必须谨慎克制，除非明确需要，否则宁可回复 WAIT。
+请根据近期输出（多行文本）决定是否要发送"一条单行命令"。你必须谨慎克制，除非明确需要，否则宁可回复 WAIT。
 
 输出要求（非常重要）：
 1) 只能输出一行纯文本，不要 Markdown、不要代码块、不要多余解释。
@@ -24,7 +25,8 @@ _FALLBACK_PROMPT = u"""你是一个“AI 监工/督导”，负责监管 Codex�
 2) 如果当前 AI 仍在执行、等待更多上下文、或者你并不确定下一步，输出：WAIT。
 3) 遇到危险/破坏性操作（delete/remove/reset/drop/overwrite/force 等）必须输出：WAIT。
 4) 若发现错误/失败/异常，请给出一句简洁指令，提醒它诊断并修复。
-5) 只有在对下一步有明确、具体的指令时才输出该指令；避免使用“continue”“keep going”这类空泛回复，除非输出里明确要求输入 continue。
+5) 只有在对下一步有明确、具体的指令时才输出该指令；避免使用"continue""keep going"这类空泛回复，除非输出里明确要求输入 continue。
+6) 【重要】如果 [monitor-meta] same_response_count > 0，说明你之前的回复被重复发送了，请尝试不同的指令或输出 WAIT 等待更多信息。不要机械重复同一指令。
 """
 
 
@@ -72,6 +74,7 @@ def _compose_auto_prompt():
 3) 严禁输出空泛的 continue/keep going，除非日志明确让你输入 continue；
 4) 检测到危险操作（delete/remove/reset/drop/overwrite/force 等）时，必须返回 WAIT。
 5) 推荐结构化输出（单行）：STAGE=<planning|coding|testing|fixing|refining|reviewing|documenting|release|done|blocked|waiting|unknown>; CMD=<WAIT 或可执行命令>。
+6) 【重要】如果 [monitor-meta] same_response_count > 0，说明你之前的回复被重复发送了，请尝试不同的指令或输出 WAIT。不要机械重复。
 
 附加上下文：
 - 你会看到若干 `[monitor-meta] key: value` 行，其中包含 `stage / stage_history / last_response / same_response_count`；
@@ -98,13 +101,9 @@ def _normalize_base_url(base_url):
 
 
 def _read_stdin_text():
-    data = sys.stdin.read()
-    if isinstance(data, bytes):
-        try:
-            return data.decode("utf-8", "replace")
-        except Exception:
-            return data.decode(errors="replace")
-    return data
+    # 直接读取原始字节，避免 sys.stdin.read() 自动解码失败
+    data = sys.stdin.buffer.read()
+    return data.decode("utf-8", "replace")
 
 
 def _first_non_empty_line(text):
@@ -117,14 +116,31 @@ def _first_non_empty_line(text):
 
 def _strip_fences_and_quotes(text):
     text = (text or "").strip()
+
+    # Strip Markdown code fences (```lang ... ```) safely.
     if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 3:
-            text = "\n".join(parts[1:-1]).strip()
-    text = _first_non_empty_line(text)
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"', "`"):
-        text = text[1:-1].strip()
-    return text
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # Prefer structured output even if the model emits extra lines.
+    stage_match = re.search(r"(?i)\bstage\s*[:=]\s*([a-z-]+)\b", text)
+    cmd_match = re.search(r"(?i)\bcmd\s*[:=]\s*(.+)", text)
+    if stage_match and cmd_match:
+        stage = (stage_match.group(1) or "").strip().lower()
+        cmd_raw = (cmd_match.group(1) or "").strip()
+        cmd_line = _first_non_empty_line(cmd_raw)
+        reconstructed = "STAGE=%s; CMD=%s" % (stage, cmd_line or "WAIT")
+        return reconstructed.strip()
+
+    # Otherwise, pick the first meaningful line.
+    best_line = _first_non_empty_line(text)
+    if len(best_line) >= 2 and best_line[0] == best_line[-1] and best_line[0] in ("'", '"', "`"):
+        best_line = best_line[1:-1].strip()
+    return best_line
 
 
 def _chat_completions(base_url, api_key, model, system_prompt, user_content, timeout_s, max_tokens, temperature):
@@ -188,7 +204,8 @@ def main(argv):
     parser.add_argument("--role", default=role_default)
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("AI_MONITOR_LLM_TIMEOUT") or "20"))
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("AI_MONITOR_LLM_MAX_TOKENS") or "80"))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("AI_MONITOR_LLM_TEMPERATURE") or "0.2"))
+    parser.add_argument("--temperature", type=float, default=float(os.environ.get("AI_MONITOR_LLM_TEMPERATURE") or "0.5"))
+    parser.add_argument("--same-response-count", type=int, default=0, help="用于动态调整 temperature")
     parser.add_argument("--system-prompt-file", default=os.environ.get("AI_MONITOR_LLM_SYSTEM_PROMPT_FILE") or "")
     args = parser.parse_args(argv)
 
@@ -215,6 +232,15 @@ def main(argv):
     pane_output = _read_stdin_text()
     user_content = u"当前角色: %s\n\n被监控 AI 最近输出如下（原样）：\n\n%s" % (role_display, pane_output)
 
+    # 动态 Temperature：重复次数越多，随机性越高
+    dynamic_temp = args.temperature
+    if args.same_response_count > 0:
+        # 每次重复增加 0.15，最高到 0.95
+        dynamic_temp = min(0.95, args.temperature + args.same_response_count * 0.15)
+        sys.stderr.write("[llm] Dynamic temperature: %.2f (base=%.2f, repeat=%d)\n" % (
+            dynamic_temp, args.temperature, args.same_response_count
+        ))
+
     data = _chat_completions(
         base_url=args.base_url,
         api_key=args.api_key,
@@ -223,7 +249,7 @@ def main(argv):
         user_content=user_content,
         timeout_s=args.timeout,
         max_tokens=args.max_tokens,
-        temperature=args.temperature,
+        temperature=dynamic_temp,
     )
 
     choices = data.get("choices") or []

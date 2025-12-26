@@ -166,6 +166,82 @@ PY
     return 0
 }
 
+# 功能选择提示
+prompt_features_choice() {
+    local input="/dev/stdin"
+    local out="/dev/fd/2"
+    if [ -r /dev/tty ]; then
+        input="/dev/tty"
+    fi
+    if [ -w /dev/tty ]; then
+        out="/dev/tty"
+    fi
+
+    printf "\n" > "$out"
+    printf "启用扩展功能（多选，用空格分隔，回车跳过）：\n" > "$out"
+    printf "  1) memory     任务记忆 - 记录决策历史，支持恢复\n" > "$out"
+    printf "  2) notify     桌面通知 - 卡住/危险操作时提醒\n" > "$out"
+    printf "  3) assess     自我评估 - 检测死循环，自动切换角色\n" > "$out"
+    printf "  4) all        全部启用（推荐，含多Agent+仲裁）\n" > "$out"
+    printf "  5) pipeline   多Agent编排 - 多角色并行/投票决策\n" > "$out"
+    printf "  6) arbiter    决策仲裁 - 多源建议冲突消解\n" > "$out"
+    printf "输入编号: " > "$out"
+
+    local selection
+    read -r selection < "$input"
+
+    if [ -z "$selection" ]; then
+        return
+    fi
+
+    # 解析选择
+    local enable_memory=0
+    local enable_notify=0
+    local enable_assess=0
+    local enable_orchestrator=0
+    local enable_arbiter=0
+
+    for item in $selection; do
+        case "$item" in
+            1|memory)  enable_memory=1 ;;
+            2|notify)  enable_notify=1 ;;
+            3|assess)  enable_assess=1 ;;
+            4|all)     enable_memory=1; enable_notify=1; enable_assess=1; enable_orchestrator=1; enable_arbiter=1 ;;
+            5|pipeline) enable_orchestrator=1 ;;
+            6|arbiter)  enable_arbiter=1 ;;
+        esac
+    done
+
+    # 设置环境变量
+    if [ "$enable_memory" = "1" ]; then
+        export AI_MONITOR_MEMORY_ENABLED=1
+        printf "  ✅ 任务记忆已启用\n" > "$out"
+    fi
+    if [ "$enable_notify" = "1" ]; then
+        export AI_MONITOR_NOTIFICATION_ENABLED=1
+        # 确保配置文件存在
+        if [ ! -f "${HOME}/.tmux-monitor/config/notification.json" ]; then
+            python3 "${SCRIPT_DIR}/notification_hub.py" config init >/dev/null 2>&1 || true
+        fi
+        printf "  ✅ 桌面通知已启用\n" > "$out"
+    fi
+    if [ "$enable_assess" = "1" ]; then
+        export AI_MONITOR_ASSESSMENT_ENABLED=1
+        printf "  ✅ 自我评估已启用\n" > "$out"
+    fi
+    if [ "$enable_orchestrator" = "1" ]; then
+        export AI_MONITOR_ORCHESTRATOR_ENABLED=1
+        if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
+            export AI_MONITOR_PIPELINE="vote"
+        fi
+        printf "  ✅ 多Agent编排已启用 (pipeline=%s)\n" "${AI_MONITOR_PIPELINE}" > "$out"
+    fi
+    if [ "$enable_arbiter" = "1" ]; then
+        export AI_MONITOR_ARBITER_ENABLED=1
+        printf "  ✅ 决策仲裁已启用\n" > "$out"
+    fi
+}
+
 prompt_role_choice() {
     load_role_choices
 
@@ -238,6 +314,9 @@ show_help() {
   clean                 - 清理旧日志
   install [name]        - 安装到 ~/.local/bin（默认命令名: cm）
   test                  - 测试 LLM 配置与连通性（不启动监控）
+  pipeline              - 多Agent编排（投票/串行）
+  arbiter               - 决策仲裁（冲突消解/安全优先）
+  memory / notify / assess - 扩展模块命令（任务记忆/通知/评估）
 
 参数格式:
   target: 会话:窗口.面板（窗口可用编号或名称；推荐用编号以避免重名/歧义，例如: 2:1.0 或 2:mon.0）
@@ -254,6 +333,10 @@ LLM 监工参数（传给 run / 默认 target 调用）:
   --role <role>
   --timeout <sec>
   --system-prompt-file <file>
+  --with-orchestrator      # 启用多Agent编排（默认 pipeline=vote）
+  --with-arbiter           # 启用决策仲裁（多源建议冲突消解）
+  --pipeline <name>        # 选择 pipeline: default|vote|sequential|auto
+  --with-all               # 启用 memory+notify+assess+orchestrator+arbiter
 
 示例:
   ${CMD} list                      # 查看所有可监控的面板
@@ -407,6 +490,7 @@ list_tmux_panes() {
             return
         fi
 
+        # 功能默认全部启用，直接启动
         start_llm_monitor "$chosen_target"
         # 启动后自动进入 tail 模式
         echo ""
@@ -459,18 +543,89 @@ start_llm_monitor() {
         local has_explicit_role=0
         local idx=0
         local args_count="${#extra_args[@]}"
+        local filtered_args=()
+
+        # 解析扩展功能参数
         while [ $idx -lt $args_count ]; do
-            if [ "${extra_args[$idx]}" = "--role" ]; then
-                has_explicit_role=1
-                if [ $((idx + 1)) -lt $args_count ]; then
-                    configured_role="${extra_args[$((idx + 1))]}"
-                else
-                    configured_role="(missing)"
-                fi
-                break
-            fi
-            idx=$((idx + 1))
+            case "${extra_args[$idx]}" in
+                --role)
+                    has_explicit_role=1
+                    if [ $((idx + 1)) -lt $args_count ]; then
+                        configured_role="${extra_args[$((idx + 1))]}"
+                    else
+                        configured_role="(missing)"
+                    fi
+                    filtered_args+=("${extra_args[$idx]}" "${extra_args[$((idx + 1))]}")
+                    idx=$((idx + 2))
+                    ;;
+                --with-memory)
+                    export AI_MONITOR_MEMORY_ENABLED=1
+                    idx=$((idx + 1))
+                    ;;
+                --with-notify)
+                    export AI_MONITOR_NOTIFICATION_ENABLED=1
+                    # 确保配置文件存在
+                    if [ ! -f "${HOME}/.tmux-monitor/config/notification.json" ]; then
+                        python3 "${SCRIPT_DIR}/notification_hub.py" config init >/dev/null 2>&1 || true
+                    fi
+                    idx=$((idx + 1))
+                    ;;
+                --with-assess)
+                    export AI_MONITOR_ASSESSMENT_ENABLED=1
+                    idx=$((idx + 1))
+                    ;;
+                --with-orchestrator)
+                    export AI_MONITOR_ORCHESTRATOR_ENABLED=1
+                    if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
+                        export AI_MONITOR_PIPELINE="vote"
+                    fi
+                    idx=$((idx + 1))
+                    ;;
+                --with-arbiter)
+                    export AI_MONITOR_ARBITER_ENABLED=1
+                    idx=$((idx + 1))
+                    ;;
+                --pipeline)
+                    if [ $((idx + 1)) -lt $args_count ]; then
+                        export AI_MONITOR_PIPELINE="${extra_args[$((idx + 1))]}"
+                        export AI_MONITOR_ORCHESTRATOR_ENABLED=1
+                    fi
+                    idx=$((idx + 2))
+                    ;;
+                --with-all)
+                    export AI_MONITOR_MEMORY_ENABLED=1
+                    export AI_MONITOR_NOTIFICATION_ENABLED=1
+                    export AI_MONITOR_ASSESSMENT_ENABLED=1
+                    export AI_MONITOR_ORCHESTRATOR_ENABLED=1
+                    export AI_MONITOR_ARBITER_ENABLED=1
+                    if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
+                        export AI_MONITOR_PIPELINE="vote"
+                    fi
+                    if [ ! -f "${HOME}/.tmux-monitor/config/notification.json" ]; then
+                        python3 "${SCRIPT_DIR}/notification_hub.py" config init >/dev/null 2>&1 || true
+                    fi
+                    idx=$((idx + 1))
+                    ;;
+                *)
+                    filtered_args+=("${extra_args[$idx]}")
+                    idx=$((idx + 1))
+                    ;;
+            esac
         done
+        extra_args=("${filtered_args[@]}")
+        args_count="${#extra_args[@]}"
+
+        # 检查是否已设置角色
+        if [ $has_explicit_role -eq 0 ]; then
+            idx=0
+            while [ $idx -lt $args_count ]; do
+                if [ "${extra_args[$idx]}" = "--role" ]; then
+                    has_explicit_role=1
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+        fi
 
         if [ $has_explicit_role -eq 0 ]; then
             if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
@@ -497,6 +652,16 @@ start_llm_monitor() {
         echo "  模式: LLM 监工（OpenAI 兼容接口）"
         if [ -n "$configured_role" ]; then
             echo "  角色: $configured_role"
+        fi
+        # 显示已启用的扩展功能
+        local features=""
+        [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && features="${features}记忆 "
+        [ "${AI_MONITOR_NOTIFICATION_ENABLED:-1}" = "1" ] && features="${features}通知 "
+        [ "${AI_MONITOR_ASSESSMENT_ENABLED:-1}" = "1" ] && features="${features}评估 "
+        [ "${AI_MONITOR_ORCHESTRATOR_ENABLED:-0}" = "1" ] && features="${features}多Agent(${AI_MONITOR_PIPELINE:-default}) "
+        [ "${AI_MONITOR_ARBITER_ENABLED:-0}" = "1" ] && features="${features}仲裁 "
+        if [ -n "$features" ]; then
+            echo -e "  扩展: ${YELLOW}${features}${NC}"
         fi
         echo "  日志: $LOG_DIR/smart_${target_id}.log"
         echo ""
@@ -973,6 +1138,29 @@ case "$cmd" in
         ;;
     test)
         test_llm "$@"
+        ;;
+    # ============================================
+    # 扩展功能命令
+    # ============================================
+    memory)
+        # 任务记忆管理
+        python3 "${SCRIPT_DIR}/memory_manager.py" "$@"
+        ;;
+    notify)
+        # 通知管理
+        python3 "${SCRIPT_DIR}/notification_hub.py" "$@"
+        ;;
+    assess)
+        # 质量评估
+        python3 "${SCRIPT_DIR}/quality_assessor.py" "$@"
+        ;;
+    pipeline)
+        # 多Agent编排
+        python3 "${SCRIPT_DIR}/agent_orchestrator.py" "$@"
+        ;;
+    arbiter)
+        # 决策仲裁
+        python3 "${SCRIPT_DIR}/decision_arbiter.py" "$@"
         ;;
     *)
         show_help

@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "max_history": 20,
+  "thresholds": {
+    "stuck_rounds": 3,
+    "same_output_count": 4,
+    "error_repeat_count": 3,
+    "max_idle_minutes": 5
+  },
+  "role_suggestions": {
+    "stuck_in_coding": "senior-engineer",
+    "stuck_in_testing": "test-manager",
+    "stuck_in_planning": "architect",
+    "stuck_in_fixing": "senior-engineer",
+    "stuck_in_reviewing": "architect",
+    "error_repeat": "senior-engineer",
+    "default": "monitor"
+  }
+}

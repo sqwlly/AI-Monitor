@@ -6,6 +6,8 @@
 
 - **LLM 监工**：把最近输出交给另一个模型（OpenAI 兼容接口）生成“单行回复”，并发送回目标面板
 - **多角色提示词**：内置 `monitor / architect / ui-designer / game-designer / algo-engineer / senior-engineer / test-manager`，并支持 `--role auto` 由脚本根据阶段自动选角（更可预测、可回放）
+- **多 Agent 编排（可选）**：并行调用多个角色给出建议（`pipeline=vote/sequential`），用于“AI 使用 AI”协作推进
+- **决策仲裁（可选）**：对多源建议进行冲突消解与安全优先的最终选择（避免单一模型误判/重复）
 - **研发阶段感知**：以规则为主解析面板输出得到 `planning / coding / testing / fixing / refining / documenting / release / done` 等阶段，并通过 `[monitor-meta] stage*` 提供给 LLM；同时支持 LLM 以 `STAGE=...; CMD=...` 形式给出阶段建议（仅在规则不确定时采纳）；auto 模式会基于阶段稳定切换 persona 或暂停
 - **支持千问（Qwen）**：可用本地 Ollama（OpenAI 兼容接口）运行 `qwen2.5*` 作为监工模型
 - **安全默认**：检测到“进行中/危险确认”时输出 `WAIT`，避免自动确认破坏性操作
@@ -187,7 +189,23 @@ cm "2:mon.0" --role test-manager           # 专注测试/质量任务
 
 LLM 调用控制（可选）：
 
-- `AI_MONITOR_LLM_REQUERY_SAME_OUTPUT_AFTER`：同一“面板输出快照”允许再次请求 LLM 的最小间隔（秒）；默认 `0` 表示只要面板输出没变化就不重复请求（避免空闲时反复打 LLM）。
+- `AI_MONITOR_LLM_REQUERY_SAME_OUTPUT_AFTER`：同一“面板输出快照”允许再次请求 LLM 的最小间隔（秒）；默认 `30`，用于在面板长时间无新输出时持续“保活推进”（设为 `0` 可禁用重复请求以节省调用）。
+- `AI_MONITOR_LLM_REQUERY_ON_REPEAT_AFTER`：当 LLM 重复给出与上次发送相同的指令时，加速重试的最小间隔（秒）；默认 `16`，用于更快跳出“机械式重复”。
+- `AI_MONITOR_CAPTURE_LINES`：`tmux capture-pane` 捕获最近 N 行输出作为上下文；默认 `120`（越大上下文越充分，但会增加 LLM 输入）。
+- `AI_MONITOR_BUSY_GRACE_S`：检测到 Running/Building/Spinner 等“运行中关键词”后的宽限期（秒）；默认 `90`，超过后视为可能卡住，允许询问 LLM 给出诊断/推进命令。
+
+多 Agent / 仲裁（可选）：
+
+- `AI_MONITOR_ORCHESTRATOR_ENABLED`：启用多 Agent 编排（`0/1`，默认 `0`）
+- `AI_MONITOR_PIPELINE`：选择编排流水线（`default | vote | sequential | auto`；默认 `vote`）
+- `AI_MONITOR_PIPELINE_CONFIG`：自定义 pipelines 配置文件路径（JSON）
+- `AI_MONITOR_ARBITER_ENABLED`：启用决策仲裁（`0/1`，默认 `0`）
+
+示例（开启“AI 使用 AI”模式）：
+
+```bash
+cm "2:mon.0" --with-orchestrator --pipeline vote --with-arbiter
+```
 
 提示词控制（避免“一直 continue”）：
 

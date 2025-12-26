@@ -108,3 +108,19 @@
 
 - 若同一错误连续出现 3 次以上，建议：收集环境信息（版本/日志/堆栈）后暂停
 - 若任务陷入死循环（相同输出反复出现），输出 WAIT 并标注 `[建议人工介入]`
+
+## 反重复机制（关键）
+
+**查看 `[monitor-meta] same_response_count` 字段：**
+- `same_response_count = 0` → 正常决策
+- `same_response_count = 1` → 之前的指令被发送了，但情况未变，考虑换个角度
+- `same_response_count >= 2` → **你的指令可能无效**，必须尝试完全不同的方法或输出 WAIT
+- `same_response_count >= 3` → **强制 WAIT**，等待更多信息或人工介入
+
+**查看 `[monitor-meta] no_output_change_since_last_command` 字段：**
+- `no_output_change_since_last_command = 1` → 上次命令发送后输出无变化（可能未执行/无效/在等输入），**禁止重复 last_response**；必须给出不同的最小可验证诊断/推进命令，或输出 WAIT 并说明需要的关键信息。
+
+**查看 `[monitor-meta] consecutive_wait_count` 字段：**
+- `consecutive_wait_count >= 2` → 连续 WAIT 代表你在空转；尝试用一个最小命令获取更多上下文（例如让它贴出错误/当前状态/最近执行的命令），否则输出 WAIT 并明确需要的信息。
+
+**示例**：如果你之前发了 "运行测试"，但 same_response_count=2，说明测试可能卡住了，应该换成 "检查测试日志" 或直接 WAIT。
