@@ -207,6 +207,40 @@ LLM 调用控制（可选）：
 cm "2:mon.0" --with-orchestrator --pipeline vote --with-arbiter
 ```
 
+### Agent-of-Agent（目标/协议/闭环，可选）
+
+当你希望“监工推动 Codex/Claude Code 完成功能开发（而不只是跑测试）”，推荐启用 Agent-of-Agent 模式。
+
+最简用法（推荐，交互模式默认全量使能）：
+
+```bash
+cm list   # 交互选择面板后自动启动
+cm        # 也可直接交互选择
+```
+
+非交互/脚本场景可显式启用：
+
+```bash
+cm "2:mon.0" --with-all
+```
+
+Goal/DoD（可选但建议）：默认会尝试从对话/输出中自动抽取 intent 并生成 plan；若你想更可控，可手动覆盖：
+
+```bash
+cm goal set "2:mon.0" --goal "实现 xxx" --dod "相关测试通过" --dod "更新文档/README" --constraint "不引入新依赖"
+```
+
+执行器协议（强烈建议）：让被监控执行器在输出末尾追加状态块，格式见 `docs/EXECUTOR_PROTOCOL.md`。
+
+相关环境变量（可选）：
+
+- `AI_MONITOR_SPEC_DIR`：spec 文件保存目录（默认 `~/.tmux-monitor/spec/`）
+- `AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED`：启用执行器协议握手/解析（`0/1`）
+- `AI_MONITOR_AGENT_LOOP_ENABLED`：启用计划闭环（发送动作后自动启动 plan step；`0/1`）
+- `AI_MONITOR_INTERACTIVE_DEFAULT_ALL`：交互模式是否默认全量使能（`0/1`，默认 `1`）
+- `AI_MONITOR_PROMPT_APPENDIX_ENABLED`：是否追加 Agent-of-Agent 附录到 system prompt（`0/1`，默认 `1`）
+- `AI_MONITOR_EXECUTOR_PROTOCOL_BOOTSTRAP_MSG`：自定义协议握手提示（单行）
+
 提示词控制（避免“一直 continue”）：
 
 - 默认系统提示词会严格要求**优先输出 `WAIT`**，只有在明确需要推进任务时才给出具体指令；若想进一步自定义，可创建 `prompt.txt` 并使用 `--system-prompt-file prompt.txt`（或设置 `AI_MONITOR_LLM_SYSTEM_PROMPT_FILE`）。
@@ -216,6 +250,7 @@ cm "2:mon.0" --with-orchestrator --pipeline vote --with-arbiter
 
 - 日志目录：`~/.tmux-monitor/`
 - PID 文件：`*.pid`（用于 stop/status）
+- `smart_*.pid` 会写入 `session_id/pane_cwd` 等元信息，供 `cm goal ...` 等命令定位会话上下文
 - 仅在 LLM 实际发送命令或触发异常时写入日志（不会为每次 `WAIT` 再刷屏），方便快速定位哪些回复已经下发
 
 ## 安全提示

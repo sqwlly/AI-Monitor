@@ -301,7 +301,7 @@ prompt_role_choice() {
 
 show_help() {
     cat << EOF
-用法: ${CMD} {run|stop|restart|status|logs|tail|list|clean|install|test} [参数]
+用法: ${CMD} {run|stop|restart|status|logs|tail|list|clean|install|test|goal|pipeline|arbiter|memory|notify|assess} [参数]
 
 命令:
   run <target> [opts]   - 🧠 启动 LLM 监工监控（默认命令）
@@ -314,6 +314,7 @@ show_help() {
   clean                 - 清理旧日志
   install [name]        - 安装到 ~/.local/bin（默认命令名: cm）
   test                  - 测试 LLM 配置与连通性（不启动监控）
+  goal                  - 🎯 设置/查看/清理会话 Goal/DoD/约束（Agent-of-Agent 入口）
   pipeline              - 多Agent编排（投票/串行）
   arbiter               - 决策仲裁（冲突消解/安全优先）
   memory / notify / assess - 扩展模块命令（任务记忆/通知/评估）
@@ -335,13 +336,21 @@ LLM 监工参数（传给 run / 默认 target 调用）:
   --system-prompt-file <file>
   --with-orchestrator      # 启用多Agent编排（默认 pipeline=vote）
   --with-arbiter           # 启用决策仲裁（多源建议冲突消解）
+  --with-protocol          # 启用执行器协议握手/解析（Agent-of-Agent）
+  --agent                  # Agent-of-Agent：协议化 + 计划闭环（等价于 --with-protocol + 开启闭环）
   --pipeline <name>        # 选择 pipeline: default|vote|sequential|auto
-  --with-all               # 启用 memory+notify+assess+orchestrator+arbiter
+  --with-all               # 启用 memory+notify+assess+orchestrator+arbiter + protocol+闭环（推荐）
+
+交互模式默认：
+  - 若未显式传上述扩展参数，则默认全量使能（可用 export AI_MONITOR_INTERACTIVE_DEFAULT_ALL=0 关闭）
 
 示例:
   ${CMD} list                      # 查看所有可监控的面板
   ${CMD} run 2:mon.0               # 🧠 LLM 监工监控
   ${CMD} 2:mon.0 --base-url "http://localhost:11434/v1" --model "qwen2.5:7b-instruct"
+  ${CMD} 2:mon.0 --agent --with-all # Agent-of-Agent：协议化 + 计划闭环 + 全部扩展
+  ${CMD} goal set 2:mon.0 --goal "实现 xxx" --dod "测试通过" --dod "更新 README"
+  ${CMD} goal plan 2:mon.0         # 基于 goal 生成并激活执行计划（plan）
   ${CMD} test                      # 测试 LLM 是否可用（返回一行 continue/WAIT 等）
   ${CMD} status                    # 查看运行状态
   ${CMD} tail 2:mon.0              # 实时查看该面板的日志
@@ -349,6 +358,85 @@ LLM 监工参数（传给 run / 默认 target 调用）:
   ${CMD} stop                      # 停止所有监控
   ${CMD} install                   # 安装命令（默认 cm）
 EOF
+}
+
+resolve_session_id_for_ref() {
+    local ref="${1:-}"
+
+    if [ -z "$ref" ]; then
+        return 1
+    fi
+
+    # ref 可能是 session_id（8位）或 tmux target（2:mon.0）
+    if is_target "$ref"; then
+        local target_id pid_file sid
+        target_id="$(resolve_target_id "$ref" 2>/dev/null || echo "")"
+        if [ -z "$target_id" ]; then
+            return 1
+        fi
+        pid_file="${LOG_DIR}/smart_${target_id}.pid"
+        sid="$(read_pid_meta "$pid_file" "session_id")"
+        if [ -n "$sid" ]; then
+            printf "%s" "$sid"
+            return 0
+        fi
+        # 回退：尝试从 memory db 里解析（可能监控异常退出但会话仍标记 active）
+        sid="$(python3 "${SCRIPT_DIR}/memory_manager.py" resolve-session "$ref" 2>/dev/null || echo "")"
+        sid="$(printf "%s" "$sid" | head -n 1 | tr -d '\r')"
+        if [ -n "$sid" ]; then
+            printf "%s" "$sid"
+            return 0
+        fi
+        return 1
+    fi
+
+    printf "%s" "$ref"
+    return 0
+}
+
+goal_cmd() {
+    local action="${1:-}"
+    shift || true
+
+    case "$action" in
+        set|show|context|clear|plan) ;;
+        *)
+            echo "用法: ${CMD} goal {set|show|context|clear|plan} <target|session_id> [args...]"
+            return 1
+            ;;
+    esac
+
+    local ref="${1:-}"
+    if [ -z "$ref" ]; then
+        echo -e "${RED}错误: 请指定 target 或 session_id${NC}"
+        return 1
+    fi
+    shift || true
+
+    local session_id
+    session_id="$(resolve_session_id_for_ref "$ref" || echo "")"
+    if [ -z "$session_id" ]; then
+        echo -e "${RED}错误: 无法解析 session_id（请确认监控已启动，或直接传 session_id）${NC}"
+        return 1
+    fi
+
+    case "$action" in
+        set)
+            python3 "${SCRIPT_DIR}/spec_manager.py" set "$session_id" "$@"
+            ;;
+        show)
+            python3 "${SCRIPT_DIR}/spec_manager.py" show "$session_id"
+            ;;
+        context)
+            python3 "${SCRIPT_DIR}/spec_manager.py" context "$session_id" "$@"
+            ;;
+        clear)
+            python3 "${SCRIPT_DIR}/spec_manager.py" clear "$session_id"
+            ;;
+        plan)
+            python3 "${SCRIPT_DIR}/spec_manager.py" ensure-plan "$session_id" "$@"
+            ;;
+    esac
 }
 
 is_target() {
@@ -452,7 +540,7 @@ list_tmux_panes() {
                     echo "      监控命令: ${CMD} \"${target}\"  (window=${window_name})"
                 fi
                 if [ -z "${AI_MONITOR_LLM_ROLE:-}" ]; then
-                    echo "      角色选择: 交互终端启动时会提示选择（默认 auto）"
+                    echo "      角色: 默认 auto（可用 --role 或 AI_MONITOR_LLM_ROLE 覆盖）"
                 fi
             done < <(tmux list-panes -t "$session:$window_index" -F "#{pane_index}: #{pane_current_command}" 2>/dev/null || true)
         done < <(tmux list-windows -t "$session" -F "#{window_index}:#{window_name}" 2>/dev/null || true)
@@ -490,7 +578,7 @@ list_tmux_panes() {
             return
         fi
 
-        # 功能默认全部启用，直接启动
+        # 交互模式：默认全量使能（Agent-of-Agent + 全部扩展）
         start_llm_monitor "$chosen_target"
         # 启动后自动进入 tail 模式
         echo ""
@@ -545,6 +633,13 @@ start_llm_monitor() {
         local args_count="${#extra_args[@]}"
         local filtered_args=()
 
+        local interactive_mode=0
+        if [ -t 0 ] && [ -t 1 ]; then
+            interactive_mode=1
+        fi
+        local interactive_default_all="${AI_MONITOR_INTERACTIVE_DEFAULT_ALL:-1}"
+        local has_feature_flags=0
+
         # 解析扩展功能参数
         while [ $idx -lt $args_count ]; do
             case "${extra_args[$idx]}" in
@@ -559,10 +654,19 @@ start_llm_monitor() {
                     idx=$((idx + 2))
                     ;;
                 --with-memory)
+                    has_feature_flags=1
                     export AI_MONITOR_MEMORY_ENABLED=1
                     idx=$((idx + 1))
                     ;;
+                --agent)
+                    # Agent-of-Agent：协议化 + 计划闭环（可与 --with-all 叠加）
+                    has_feature_flags=1
+                    export AI_MONITOR_AGENT_LOOP_ENABLED=1
+                    export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
+                    idx=$((idx + 1))
+                    ;;
                 --with-notify)
+                    has_feature_flags=1
                     export AI_MONITOR_NOTIFICATION_ENABLED=1
                     # 确保配置文件存在
                     if [ ! -f "${HOME}/.tmux-monitor/config/notification.json" ]; then
@@ -571,10 +675,12 @@ start_llm_monitor() {
                     idx=$((idx + 1))
                     ;;
                 --with-assess)
+                    has_feature_flags=1
                     export AI_MONITOR_ASSESSMENT_ENABLED=1
                     idx=$((idx + 1))
                     ;;
                 --with-orchestrator)
+                    has_feature_flags=1
                     export AI_MONITOR_ORCHESTRATOR_ENABLED=1
                     if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
                         export AI_MONITOR_PIPELINE="vote"
@@ -582,10 +688,17 @@ start_llm_monitor() {
                     idx=$((idx + 1))
                     ;;
                 --with-arbiter)
+                    has_feature_flags=1
                     export AI_MONITOR_ARBITER_ENABLED=1
                     idx=$((idx + 1))
                     ;;
+                --with-protocol)
+                    has_feature_flags=1
+                    export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
+                    idx=$((idx + 1))
+                    ;;
                 --pipeline)
+                    has_feature_flags=1
                     if [ $((idx + 1)) -lt $args_count ]; then
                         export AI_MONITOR_PIPELINE="${extra_args[$((idx + 1))]}"
                         export AI_MONITOR_ORCHESTRATOR_ENABLED=1
@@ -593,11 +706,14 @@ start_llm_monitor() {
                     idx=$((idx + 2))
                     ;;
                 --with-all)
+                    has_feature_flags=1
                     export AI_MONITOR_MEMORY_ENABLED=1
                     export AI_MONITOR_NOTIFICATION_ENABLED=1
                     export AI_MONITOR_ASSESSMENT_ENABLED=1
                     export AI_MONITOR_ORCHESTRATOR_ENABLED=1
                     export AI_MONITOR_ARBITER_ENABLED=1
+                    export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
+                    export AI_MONITOR_AGENT_LOOP_ENABLED=1
                     if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
                         export AI_MONITOR_PIPELINE="vote"
                     fi
@@ -615,6 +731,23 @@ start_llm_monitor() {
         extra_args=("${filtered_args[@]}")
         args_count="${#extra_args[@]}"
 
+        # 交互模式：若用户未显式指定任何扩展参数，则默认全量使能（可用 AI_MONITOR_INTERACTIVE_DEFAULT_ALL=0 关闭）
+        if [ "$interactive_mode" = "1" ] && [ "$interactive_default_all" = "1" ] && [ "$has_feature_flags" -eq 0 ]; then
+            export AI_MONITOR_MEMORY_ENABLED=1
+            export AI_MONITOR_NOTIFICATION_ENABLED=1
+            export AI_MONITOR_ASSESSMENT_ENABLED=1
+            export AI_MONITOR_ORCHESTRATOR_ENABLED=1
+            export AI_MONITOR_ARBITER_ENABLED=1
+            export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
+            export AI_MONITOR_AGENT_LOOP_ENABLED=1
+            if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
+                export AI_MONITOR_PIPELINE="vote"
+            fi
+            if [ ! -f "${HOME}/.tmux-monitor/config/notification.json" ]; then
+                python3 "${SCRIPT_DIR}/notification_hub.py" config init >/dev/null 2>&1 || true
+            fi
+        fi
+
         # 检查是否已设置角色
         if [ $has_explicit_role -eq 0 ]; then
             idx=0
@@ -628,16 +761,17 @@ start_llm_monitor() {
         fi
 
         if [ $has_explicit_role -eq 0 ]; then
-            if [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
-                configured_role="${AI_MONITOR_LLM_ROLE}"
-            elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+            if [ "$interactive_mode" = "1" ]; then
                 local chosen_role
                 chosen_role="$(prompt_role_choice)"
                 if [ -z "$chosen_role" ]; then
-                    chosen_role="auto"
+                    chosen_role="${AI_MONITOR_LLM_ROLE:-auto}"
                 fi
                 extra_args=(--role "$chosen_role" "${extra_args[@]}")
                 configured_role="$chosen_role"
+            elif [ -n "${AI_MONITOR_LLM_ROLE:-}" ]; then
+                extra_args=(--role "${AI_MONITOR_LLM_ROLE}" "${extra_args[@]}")
+                configured_role="${AI_MONITOR_LLM_ROLE}"
             else
                 extra_args=(--role "auto" "${extra_args[@]}")
                 configured_role="auto"
@@ -653,16 +787,18 @@ start_llm_monitor() {
         if [ -n "$configured_role" ]; then
             echo "  角色: $configured_role"
         fi
-        # 显示已启用的扩展功能
-        local features=""
-        [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && features="${features}记忆 "
-        [ "${AI_MONITOR_NOTIFICATION_ENABLED:-1}" = "1" ] && features="${features}通知 "
-        [ "${AI_MONITOR_ASSESSMENT_ENABLED:-1}" = "1" ] && features="${features}评估 "
-        [ "${AI_MONITOR_ORCHESTRATOR_ENABLED:-0}" = "1" ] && features="${features}多Agent(${AI_MONITOR_PIPELINE:-default}) "
-        [ "${AI_MONITOR_ARBITER_ENABLED:-0}" = "1" ] && features="${features}仲裁 "
-        if [ -n "$features" ]; then
-            echo -e "  扩展: ${YELLOW}${features}${NC}"
-        fi
+	        # 显示已启用的扩展功能
+	        local features=""
+	        [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && features="${features}记忆 "
+	        [ "${AI_MONITOR_NOTIFICATION_ENABLED:-1}" = "1" ] && features="${features}通知 "
+	        [ "${AI_MONITOR_ASSESSMENT_ENABLED:-1}" = "1" ] && features="${features}评估 "
+	        [ "${AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED:-0}" = "1" ] && features="${features}协议 "
+	        [ "${AI_MONITOR_AGENT_LOOP_ENABLED:-0}" = "1" ] && features="${features}闭环 "
+	        [ "${AI_MONITOR_ORCHESTRATOR_ENABLED:-0}" = "1" ] && features="${features}多Agent(${AI_MONITOR_PIPELINE:-default}) "
+	        [ "${AI_MONITOR_ARBITER_ENABLED:-0}" = "1" ] && features="${features}仲裁 "
+	        if [ -n "$features" ]; then
+	            echo -e "  扩展: ${YELLOW}${features}${NC}"
+	        fi
         echo "  日志: $LOG_DIR/smart_${target_id}.log"
         echo ""
         echo "使用 '${CMD} tail $target' 实时查看日志"
@@ -1158,12 +1294,16 @@ case "$cmd" in
         # 多Agent编排
         python3 "${SCRIPT_DIR}/agent_orchestrator.py" "$@"
         ;;
-    arbiter)
-        # 决策仲裁
-        python3 "${SCRIPT_DIR}/decision_arbiter.py" "$@"
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
+	    arbiter)
+	        # 决策仲裁
+	        python3 "${SCRIPT_DIR}/decision_arbiter.py" "$@"
+	        ;;
+	    goal)
+	        # 会话 Goal/DoD/约束（Agent-of-Agent 入口）
+	        goal_cmd "$@"
+	        ;;
+	    *)
+	        show_help
+	        exit 1
+	        ;;
+	esac

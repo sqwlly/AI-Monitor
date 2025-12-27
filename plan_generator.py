@@ -197,13 +197,34 @@ class PlanGenerator:
 
     # Goal type patterns
     GOAL_PATTERNS = {
-        "implement": [r"implement", r"create", r"add", r"build", r"develop"],
-        "fix": [r"fix", r"repair", r"resolve", r"debug", r"solve"],
-        "refactor": [r"refactor", r"improve", r"optimize", r"clean", r"restructure"],
-        "test": [r"test", r"verify", r"validate", r"check"],
-        "deploy": [r"deploy", r"release", r"publish", r"ship"],
-        "configure": [r"configure", r"setup", r"install", r"enable"],
-        "document": [r"document", r"describe", r"explain", r"comment"],
+        "implement": [
+            r"implement", r"create", r"add", r"build", r"develop",
+            r"实现", r"开发", r"新增", r"添加", r"创建", r"编写", r"接入", r"支持",
+        ],
+        "fix": [
+            r"fix", r"repair", r"resolve", r"debug", r"solve",
+            r"修复", r"解决", r"排查", r"定位", r"bug",
+        ],
+        "refactor": [
+            r"refactor", r"improve", r"optimize", r"clean", r"restructure",
+            r"重构", r"优化", r"改进", r"整理",
+        ],
+        "test": [
+            r"test", r"verify", r"validate", r"check",
+            r"测试", r"验证", r"回归", r"检查",
+        ],
+        "deploy": [
+            r"deploy", r"release", r"publish", r"ship",
+            r"部署", r"发布", r"上线",
+        ],
+        "configure": [
+            r"configure", r"setup", r"install", r"enable",
+            r"配置", r"设置", r"安装", r"启用",
+        ],
+        "document": [
+            r"document", r"describe", r"explain", r"comment",
+            r"文档", r"说明", r"注释", r"写清", r"补充说明",
+        ],
     }
 
     # Risk patterns
@@ -943,6 +964,11 @@ def main():
     # status command (快捷命令：获取会话当前计划状态)
     status_parser = subparsers.add_parser("status", help="Get current plan status for session")
     status_parser.add_argument("session_id", help="Session ID")
+    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # auto-start command (快捷命令：为 active plan 自动启动下一个可执行 step)
+    auto_start_parser = subparsers.add_parser("auto-start", help="Auto start next step for active plan")
+    auto_start_parser.add_argument("session_id", help="Session ID")
 
     args = parser.parse_args()
     generator = PlanGenerator()
@@ -984,36 +1010,75 @@ def main():
         print(json.dumps(history, indent=2))
 
     elif args.command == "status":
-        # 查找会话当前活动的计划
+        # 查找会话当前未结束的计划（active 优先，其次 draft/paused）
         with generator._get_conn() as conn:
             plan_row = conn.execute("""
                 SELECT * FROM plans
-                WHERE session_id = ? AND status IN ('pending', 'in_progress')
+                WHERE session_id = ?
+                  AND status NOT IN ('completed', 'abandoned', 'failed')
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (args.session_id,)).fetchone()
 
             if plan_row:
                 plan = generator._row_to_plan(plan_row)
-                # 计算进度
                 total_steps = len(plan.steps)
-                completed = sum(1 for s in plan.steps if s.status == "completed")
-                in_progress = sum(1 for s in plan.steps if s.status == "in_progress")
+                completed = sum(
+                    1 for s in plan.steps
+                    if s.status in (StepStatus.COMPLETED, StepStatus.SKIPPED)
+                )
 
-                # 找到当前步骤
-                current_step = None
-                for s in plan.steps:
-                    if s.status == "in_progress":
-                        current_step = s
-                        break
-                    elif s.status == "pending" and current_step is None:
-                        current_step = s
+                focus_step = plan.get_current_step() or plan.get_next_step()
+                focus = None
+                if focus_step:
+                    focus = {
+                        "index": focus_step.index,
+                        "title": focus_step.title,
+                        "description": focus_step.description,
+                        "step_type": focus_step.step_type.value,
+                        "status": focus_step.status.value,
+                        "action": focus_step.action,
+                        "expected_outcome": focus_step.expected_outcome,
+                    }
 
-                # 输出简洁状态
-                status_line = f"[plan] 进度: {completed}/{total_steps}"
-                if current_step:
-                    status_line += f" | 当前: {current_step.description[:40]}"
-                print(status_line)
+                if args.json:
+                    print(json.dumps({
+                        "plan_id": plan.plan_id,
+                        "session_id": plan.session_id,
+                        "status": plan.status.value,
+                        "risk_level": plan.risk_level.value,
+                        "progress": round(plan.progress, 3),
+                        "steps_completed": completed,
+                        "steps_total": total_steps,
+                        "focus_step": focus,
+                    }, ensure_ascii=False))
+                else:
+                    status_line = f"[plan] id={plan.plan_id} status={plan.status.value} progress={completed}/{total_steps}"
+                    if focus_step:
+                        status_line += f" | focus={focus_step.index}:{focus_step.title}"
+                    status_line += f" | risk={plan.risk_level.value}"
+                    print(status_line)
+
+    elif args.command == "auto-start":
+        plans = generator.get_active_plans(args.session_id)
+        if not plans:
+            return
+
+        plan = plans[0]
+        if plan.get_current_step():
+            print("already_in_progress")
+            return
+
+        next_step = plan.get_next_step()
+        if not next_step:
+            print("no_executable_step")
+            return
+
+        started = generator.start_step(plan.plan_id, next_step.index)
+        if started:
+            print(f"started {plan.plan_id}#{started.index}")
+        else:
+            print("start_failed")
 
     else:
         parser.print_help()

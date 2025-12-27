@@ -137,6 +137,7 @@ MAX_RETRY_SAME=3          # 同一回复最大重试次数
 LOG_MAX_BYTES="${AI_MONITOR_LOG_MAX_BYTES:-10485760}"  # 默认 10MB（超过则截断保留末尾）
 MAX_STAGE_HISTORY=6       # 记录最近阶段变更
 CAPTURE_LINES="${AI_MONITOR_CAPTURE_LINES:-120}"  # capture-pane 最近 N 行（越大上下文越充分，但会增加 LLM 输入）
+STAGE_TAIL_LINES="${AI_MONITOR_STAGE_TAIL_LINES:-60}"  # 阶段检测使用末尾 N 行（0=使用全部 capture 输出）
 BUSY_GRACE_S="${AI_MONITOR_BUSY_GRACE_S:-90}"  # 运行中关键词/Spinner 的“宽限期”（秒）；超过后视为可能卡住，允许询问 LLM
 REQUERY_SAME_OUTPUT_AFTER="${AI_MONITOR_LLM_REQUERY_SAME_OUTPUT_AFTER:-30}"  # 同一面板输出快照再次请求 LLM 的最小间隔（秒）；0=永不重复请求
 REQUERY_ON_REPEAT_AFTER="${AI_MONITOR_LLM_REQUERY_ON_REPEAT_AFTER:-16}"  # LLM 重复给出同一指令时的加速重试间隔（秒）；0=禁用
@@ -145,6 +146,10 @@ REQUERY_ON_REPEAT_AFTER="${AI_MONITOR_LLM_REQUERY_ON_REPEAT_AFTER:-16}"  # LLM �
 ORCHESTRATOR_ENABLED="${AI_MONITOR_ORCHESTRATOR_ENABLED:-0}"
 ARBITER_ENABLED="${AI_MONITOR_ARBITER_ENABLED:-0}"
 ORCHESTRATOR_PIPELINE="${AI_MONITOR_PIPELINE:-vote}"
+
+# 执行器协议（Agent-of-Agent，可选）
+EXECUTOR_PROTOCOL_ENABLED="${AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED:-0}"
+AGENT_LOOP_ENABLED="${AI_MONITOR_AGENT_LOOP_ENABLED:-0}"
 
 CURRENT_STAGE="unknown"
 STAGE_HISTORY=""
@@ -159,6 +164,7 @@ STAGE_SCORE_THRESHOLD="${AI_MONITOR_STAGE_SCORE_THRESHOLD:-3}"
 STAGE_SCORE_MARGIN="${AI_MONITOR_STAGE_SCORE_MARGIN:-1}"
 LAST_STAGE_DETECTED="unknown"
 LAST_STAGE_SCORE=0
+LAST_STAGE_SOURCE="unknown"
 STAGE_HINT_LAST=""
 STAGE_HINT_STABLE_COUNT=0
 STAGE_HINT_LAST_APPLIED_AT=0
@@ -171,6 +177,12 @@ if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$CAPTURE_LINES" =~ ^[0-9]+$ ]] || [ "$CAPTURE_LINES" -lt 10 ]; then
     CAPTURE_LINES=50
+fi
+if ! [[ "$STAGE_TAIL_LINES" =~ ^[0-9]+$ ]]; then
+    STAGE_TAIL_LINES=60
+fi
+if [ "$STAGE_TAIL_LINES" -gt 0 ] && [ "$STAGE_TAIL_LINES" -lt 10 ]; then
+    STAGE_TAIL_LINES=10
 fi
 if ! [[ "$BUSY_GRACE_S" =~ ^[0-9]+$ ]]; then
     BUSY_GRACE_S=90
@@ -248,6 +260,32 @@ send_command() {
     tmux send-keys -t "$TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE" "$cmd"
     sleep 0.3
     tmux send-keys -t "$TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE" C-m
+}
+
+maybe_send_executor_protocol_bootstrap() {
+    if [ "${EXECUTOR_PROTOCOL_ENABLED:-0}" != "1" ]; then
+        return 0
+    fi
+    if [ "${EXECUTOR_PROTOCOL_BOOTSTRAP_SENT:-0}" = "1" ]; then
+        return 0
+    fi
+
+    # 单行消息：避免干扰交互，且便于被监控执行器直接复制协议块。
+    local msg="${AI_MONITOR_EXECUTOR_PROTOCOL_BOOTSTRAP_MSG:-从现在开始为便于监工闭环推进，请在每次完成一个可验证动作后，在输出末尾追加协议块：<<<AGENT_STATUS_JSON>>>{\"stage\":\"coding\",\"done\":\"...\",\"next\":\"...\",\"blockers\":[],\"plan_step\":{\"event\":\"none|started|completed|blocked|skipped\",\"index\":0,\"result\":\"...\"}}<<<END_AGENT_STATUS_JSON>>>（中间 JSON 必须是合法 JSON，可换行）。}"
+
+    log "🤝 发送执行器协议握手（仅一次）"
+    send_command "$msg"
+    EXECUTOR_PROTOCOL_BOOTSTRAP_SENT=1
+
+    # 记录到 PID 文件，供外部工具查看（失败不影响主流程）
+    {
+        printf "executor_protocol_bootstrap_sent_at=%s\n" "$(date +%s)"
+    } >> "$PID_FILE" 2>/dev/null || true
+
+    # 可选：写入工作记忆，供上下文注入/追溯
+    if [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+        python3 "${script_dir}/working_memory.py" add "$MEMORY_SESSION_ID" "context" "executor_protocol_bootstrap_sent" >/dev/null 2>&1 || true
+    fi
 }
 
 is_dangerous_command() {
@@ -366,13 +404,14 @@ score_stage_from_output() {
     local score_reviewing=0
     local score_waiting=0
 
-    if printf "%s" "$text_lower" | grep -qE "(pending approval|on hold|blocked|waiting for input|press (enter|any key)|hit enter to continue|输入以继续|等待输入|请确认|确认\\s*\\(|\\[y/n\\]|\\(y/n\\))"; then
-        score_blocked=$((score_blocked + 3))
+    # blocked: 环境/依赖/权限等导致无法继续推进（强信号）
+    if printf "%s" "$text_lower" | grep -qE "(pending approval|on hold|display\\s*(is\\s*)?(unset|empty)|\\bdisplay\\b.*为空|no\\s*gui|无\\s*gui|无法.*(devtools|开发者工具|微信开发者工具)|未安装.*(devtools|开发者工具|微信开发者工具)|环境.*(未安装|缺少).*(devtools|开发者工具|微信开发者工具)|请你.*本地.*(验证|自查)|请.*(截图|回传))"; then
+        score_blocked=$((score_blocked + 5))
     fi
 
     # waiting: 等待用户输入或外部响应
-    if printf "%s" "$text_lower" | grep -qE "(waiting for|awaiting|pending|等待中|挂起)"; then
-        score_waiting=$((score_waiting + 2))
+    if printf "%s" "$text_lower" | grep -qE "(waiting for input|press (enter|any key)|hit enter to continue|输入以继续|等待输入|请确认|确认\\s*\\(|\\[y/n\\]|\\(y/n\\)|waiting for|awaiting|pending|等待中|挂起)"; then
+        score_waiting=$((score_waiting + 3))
     fi
 
     if printf "%s" "$text_lower" | grep -qE "(traceback|stack trace|segmentation fault|segfault|panic|assertion failed)"; then
@@ -490,6 +529,91 @@ score_stage_from_output() {
     printf "%s\t%s\n" "$best_stage" "$best_score"
 }
 
+detect_stage_from_hard_blockers() {
+    local text_lower
+    # 只看末尾少量行，避免历史残留文本导致“阻塞”粘滞。
+    text_lower="$(printf "%s" "${1:-}" | tail -n 25 | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$text_lower" ]; then
+        return 0
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(pending approval|on hold|display\\s*(is\\s*)?(unset|empty)|\\bdisplay\\b.*为空|no\\s*gui|无\\s*gui|无法.*(devtools|开发者工具|微信开发者工具)|未安装.*(devtools|开发者工具|微信开发者工具)|环境.*(未安装|缺少).*(devtools|开发者工具|微信开发者工具)|请你.*本地.*(验证|自查)|请.*(截图|回传))"; then
+        echo "blocked"
+        return 0
+    fi
+
+    return 0
+}
+
+detect_stage_from_hard_waiting() {
+    local text_lower
+    text_lower="$(printf "%s" "${1:-}" | tail -n 25 | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$text_lower" ]; then
+        return 0
+    fi
+
+    if printf "%s" "$text_lower" | grep -qE "(waiting for input|press (enter|any key)|hit enter to continue|输入以继续|等待输入|请确认|确认\\s*\\(|\\[y/n\\]|\\(y/n\\))"; then
+        echo "waiting"
+        return 0
+    fi
+
+    return 0
+}
+
+detect_stage_from_cli_prompt() {
+    local text="${1:-}"
+    local idle_seconds="${2:-0}"
+
+    if [ -z "$text" ]; then
+        return 0
+    fi
+    # 仅在达到“可决策”的空闲阈值后，用 CLI Prompt 作为“当前正在等待输入”的强信号
+    if [ "$idle_seconds" -lt "$MIN_IDLE_TIME" ]; then
+        return 0
+    fi
+
+    local tail
+    tail="$(printf "%s" "$text" | tail -n 25)"
+    if printf "%s" "$tail" | grep -qE '^[[:space:]]*›[[:space:]]+'; then
+        if printf "%s" "$tail" | grep -qiE '(context left|for shortcuts)'; then
+            echo "waiting"
+            return 0
+        fi
+    fi
+
+    return 0
+}
+
+detect_stage_from_executor_status() {
+    local text="${1:-}"
+    if [ -z "$text" ]; then
+        return 0
+    fi
+    if ! printf "%s" "$text" | grep -q "<<<AGENT_STATUS_JSON>>>"; then
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local extract_out stage_line event_line
+    extract_out=$(python3 "${script_dir}/executor_protocol.py" extract 2>/dev/null <<<"$text" || echo "")
+    stage_line="$(printf "%s" "$extract_out" | sed -n '1p' | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    event_line="$(printf "%s" "$extract_out" | sed -n '2p' | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    if [ "$event_line" = "blocked" ]; then
+        echo "blocked"
+        return 0
+    fi
+
+    if is_valid_stage_label "$stage_line" && [ "$stage_line" != "unknown" ]; then
+        echo "$stage_line"
+        return 0
+    fi
+
+    return 0
+}
+
 is_valid_stage_label() {
     case "${1:-}" in
         planning|coding|testing|fixing|refining|reviewing|documenting|release|done|blocked|waiting|unknown) return 0 ;;
@@ -595,7 +719,7 @@ choose_effective_role() {
     fi
 
     if [ "$configured" != "auto" ]; then
-        echo "$configured"
+        EFFECTIVE_ROLE="$configured"
         return 0
     fi
 
@@ -614,17 +738,72 @@ choose_effective_role() {
         fi
     fi
 
-    echo "$AUTO_ROLE_CURRENT"
+    EFFECTIVE_ROLE="$AUTO_ROLE_CURRENT"
 }
 
 update_stage_tracker() {
-    local detected_stage detected_score
-    local score_line
-    score_line="$(score_stage_from_output "$1")"
-    IFS=$'\t' read -r detected_stage detected_score <<< "$score_line"
+    local output="${1:-}"
+    local idle_seconds="${2:-0}"
+
+    local detected_stage=""
+    local detected_score=0
+    local detected_source="unknown"
+    local score_line protocol_stage
+
+    protocol_stage="$(detect_stage_from_executor_status "$output")"
+
+    local stage_input="$output"
+    if [ "${STAGE_TAIL_LINES:-0}" -gt 0 ]; then
+        stage_input="$(printf "%s" "$stage_input" | tail -n "$STAGE_TAIL_LINES")"
+    fi
+
+    # 1) 执行器协议：只要明确给出 blocked，则强制 blocked
+    if [ "$protocol_stage" = "blocked" ]; then
+        detected_stage="blocked"
+        detected_score=999
+        detected_source="protocol"
+    else
+        # 2) 强规则：交互等待（y/n、press enter 等）
+        local hard_waiting
+        hard_waiting="$(detect_stage_from_hard_waiting "$stage_input")"
+        if [ "$hard_waiting" = "waiting" ]; then
+            detected_stage="waiting"
+            detected_score=999
+            detected_source="hard"
+        else
+            # 3) 强规则：CLI Prompt（到达空闲阈值后视为等待输入）
+            local prompt_stage
+            prompt_stage="$(detect_stage_from_cli_prompt "$stage_input" "$idle_seconds")"
+            if [ "$prompt_stage" = "waiting" ]; then
+                detected_stage="waiting"
+                detected_score=999
+                detected_source="prompt"
+            # 4) 执行器协议（非阻塞）：在协议存在时优先于启发式“阻塞”关键词
+            elif [ -n "$protocol_stage" ]; then
+                detected_stage="$protocol_stage"
+                detected_score=999
+                detected_source="protocol"
+            else
+                # 5) 强规则：环境/依赖阻塞（仅在无协议时作为兜底）
+                local hard_blocked
+                hard_blocked="$(detect_stage_from_hard_blockers "$stage_input")"
+                if [ "$hard_blocked" = "blocked" ]; then
+                    detected_stage="blocked"
+                    detected_score=999
+                    detected_source="hard"
+                else
+                    # 6) 兜底：关键词打分（仅用末尾 N 行，避免历史残留）
+                    score_line="$(score_stage_from_output "$stage_input")"
+                    IFS=$'\t' read -r detected_stage detected_score <<< "$score_line"
+                    detected_source="score"
+                fi
+            fi
+        fi
+    fi
 
     LAST_STAGE_DETECTED="${detected_stage:-unknown}"
     LAST_STAGE_SCORE="${detected_score:-0}"
+    LAST_STAGE_SOURCE="${detected_source:-unknown}"
 
     if [ -z "$detected_stage" ] || [ "$detected_stage" = "unknown" ]; then
         UNKNOWN_STAGE_STREAK=$((UNKNOWN_STAGE_STREAK + 1))
@@ -643,7 +822,7 @@ update_stage_tracker() {
     fi
     CURRENT_STAGE="$detected_stage"
     append_stage_history "$CURRENT_STAGE"
-    log "🧭 阶段切换 -> $CURRENT_STAGE"
+    log "🧭 阶段切换 -> $CURRENT_STAGE (source=${LAST_STAGE_SOURCE:-unknown}, score=${LAST_STAGE_SCORE:-0})"
 }
 
 # 关键安全/打断保护逻辑（避免无意义请求与危险操作）
@@ -698,6 +877,8 @@ build_decision_context() {
     if [ -n "$CURRENT_STAGE" ] && [ "$CURRENT_STAGE" != "unknown" ]; then
         meta_block+="[monitor-meta] stage: ${CURRENT_STAGE}"$'\n'
     fi
+    meta_block+="[monitor-meta] stage_source: ${LAST_STAGE_SOURCE:-unknown}"$'\n'
+    meta_block+="[monitor-meta] stage_score: ${LAST_STAGE_SCORE:-0}"$'\n'
     if [ -n "$STAGE_HISTORY" ]; then
         meta_block+="[monitor-meta] stage_history: ${STAGE_HISTORY}"$'\n'
     fi
@@ -741,6 +922,24 @@ build_decision_context() {
     # ========== 理解层集成 ==========
     # 注入意图摘要（帮助 LLM 理解用户目标）
     if [ "${AI_MONITOR_UNDERSTANDING_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+        # 注入会话 spec（Goal/DoD/约束），作为 Agent-of-Agent 的“硬约束”输入
+        local spec_context
+        spec_context=$(python3 "${script_dir}/spec_manager.py" context "$MEMORY_SESSION_ID" --max-chars 1200 2>/dev/null || echo "")
+        if [ -n "$spec_context" ]; then
+            meta_block+=$'\n'"${spec_context}"$'\n'
+            log "🧾 Spec 上下文已注入"
+        fi
+
+        # 注入执行器协议状态（可选）
+        if [ "${EXECUTOR_PROTOCOL_ENABLED:-0}" = "1" ]; then
+            local executor_status
+            executor_status=$(python3 "${script_dir}/executor_protocol.py" summary 2>/dev/null <<<"$output" || echo "")
+            if [ -n "$executor_status" ]; then
+                meta_block+=$'\n'"${executor_status}"$'\n'
+                log "🧾 执行器状态已注入"
+            fi
+        fi
+
         local intent_summary
         intent_summary=$(python3 "${script_dir}/intent_parser.py" summary "$MEMORY_SESSION_ID" 2>/dev/null || echo "")
         if [ -n "$intent_summary" ]; then
@@ -891,7 +1090,8 @@ decide_response_orchestrated() {
     fi
 
     local effective_role
-    effective_role="$(choose_effective_role "$now_s")"
+    choose_effective_role "$now_s"
+    effective_role="${EFFECTIVE_ROLE:-monitor}"
 
     local total_lines preview_limit preview_lines
     total_lines="$(printf "%s" "$output" | wc -l | tr -d ' ')"
@@ -908,28 +1108,58 @@ decide_response_orchestrated() {
     local context
     context="$(build_decision_context "$output" "$last_response" "$same_response_count" "$idle_seconds" "$now_s" "$effective_role")"
 
-    log "🗳️ 正在请求多Agent编排 (pipeline=${ORCHESTRATOR_PIPELINE}, stage=${CURRENT_STAGE:-unknown})"
+    local configured_role
+    configured_role="$(printf "%s" "${LLM_ROLE:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local primary_role_display="none"
+    if [ -n "$configured_role" ] && [ "$configured_role" != "auto" ]; then
+        primary_role_display="$configured_role"
+    fi
+
+    log "🗳️ 正在请求多Agent编排 (pipeline=${ORCHESTRATOR_PIPELINE}, stage=${CURRENT_STAGE:-unknown}, primary_role=${primary_role_display})"
     local orch_json
-    orch_json=$(python3 "$orchestrator_script" run --pipeline "$ORCHESTRATOR_PIPELINE" --stage "${CURRENT_STAGE:-unknown}" --output full 2>>"$LOG_FILE" <<<"$context") || orch_json=""
+    local -a orch_args
+    orch_args=(run --pipeline "$ORCHESTRATOR_PIPELINE" --stage "${CURRENT_STAGE:-unknown}" --output full)
+    if [ -n "$configured_role" ] && [ "$configured_role" != "auto" ]; then
+        orch_args+=(--primary-role "$configured_role")
+    fi
+
+    local env_prefix=()
+    env_prefix+=(AI_MONITOR_LLM_BASE_URL="$LLM_BASE_URL")
+    env_prefix+=(AI_MONITOR_LLM_MODEL="$LLM_MODEL")
+    env_prefix+=(AI_MONITOR_LLM_API_KEY="$LLM_API_KEY")
+    if [ -n "$LLM_TIMEOUT" ]; then
+        env_prefix+=(AI_MONITOR_LLM_TIMEOUT="$LLM_TIMEOUT")
+    fi
+    if [ -n "$LLM_SYSTEM_PROMPT_FILE" ]; then
+        env_prefix+=(AI_MONITOR_LLM_SYSTEM_PROMPT_FILE="$LLM_SYSTEM_PROMPT_FILE")
+    fi
+
+    orch_json=$(env "${env_prefix[@]}" python3 "$orchestrator_script" "${orch_args[@]}" 2>>"$LOG_FILE" <<<"$context") || orch_json=""
     if [ -z "$orch_json" ]; then
         log "⚠️ 多Agent编排返回空内容，回退单Agent"
         decide_response_llm "$output" "$last_response" "$same_response_count" "$idle_seconds" "$now_s"
         return
     fi
 
-    local -a orch_lines
-    mapfile -t orch_lines < <(
-        python3 - "$ORCHESTRATOR_PIPELINE" <<'PY' <<<"$orch_json"
-import json
-import re
-import sys
-from collections import Counter
-
-pipeline = sys.argv[1] if len(sys.argv) > 1 else "vote"
-data = json.loads(sys.stdin.read() or "{}")
-final_response = (data.get("final_response") or "").strip()
-reason = (data.get("reason") or "").strip()
-responses = data.get("responses") or []
+	    local -a orch_lines
+	    mapfile -t orch_lines < <(
+	        ORCH_PIPELINE="$ORCHESTRATOR_PIPELINE" ORCH_JSON="$orch_json" python3 - 2>>"$LOG_FILE" <<-'PY'
+	import json
+	import os
+	import re
+	import sys
+	from collections import Counter
+	
+	pipeline = (os.environ.get("ORCH_PIPELINE") or "vote").strip() or "vote"
+	raw = os.environ.get("ORCH_JSON") or ""
+	try:
+	    data = json.loads(raw or "{}")
+	except Exception as e:
+	    sys.stderr.write(f"[orchestrator-parse] invalid JSON: {e}\n")
+	    data = {}
+	final_response = (data.get("final_response") or "").strip()
+	reason = (data.get("reason") or "").strip()
+	responses = data.get("responses") or []
 
 def is_wait(text: str) -> bool:
     return (text or "").strip().upper() == "WAIT"
@@ -1054,17 +1284,23 @@ PY
         return
     fi
 
-    local -a arb_lines
-    mapfile -t arb_lines < <(
-        python3 - <<'PY' <<<"$arb_json"
-import json
-import sys
-
-d = json.loads(sys.stdin.read() or "{}")
-dec = d.get("decision") or {}
-print(dec.get("action_type", "wait"))
-print((dec.get("action_content") or "").replace("\n", " ").strip())
-print(str(dec.get("confidence", 0.0)))
+	    local -a arb_lines
+	    mapfile -t arb_lines < <(
+	        ARB_JSON="$arb_json" python3 - 2>>"$LOG_FILE" <<-'PY'
+	import json
+	import os
+	import sys
+	
+	raw = os.environ.get("ARB_JSON") or ""
+	try:
+	    d = json.loads(raw or "{}")
+	except Exception as e:
+	    sys.stderr.write(f"[arbiter-parse] invalid JSON: {e}\n")
+	    d = {}
+	dec = d.get("decision") or {}
+	print(dec.get("action_type", "wait"))
+	print((dec.get("action_content") or "").replace("\n", " ").strip())
+	print(str(dec.get("confidence", 0.0)))
 print((dec.get("explanation") or "").replace("\n", " ").strip())
 PY
     )
@@ -1159,7 +1395,8 @@ decide_response_llm() {
     fi
 
     local effective_role
-    effective_role="$(choose_effective_role "$now_s")"
+    choose_effective_role "$now_s"
+    effective_role="${EFFECTIVE_ROLE:-monitor}"
 
     local llm_args=(--base-url "$LLM_BASE_URL" --model "$LLM_MODEL" --role "$effective_role")
     if [ -n "$LLM_TIMEOUT" ]; then
@@ -1242,6 +1479,7 @@ log "📍 监控目标: $TMUX_SESSION:$TMUX_WINDOW.$TMUX_PANE"
 log "⏱️  检查间隔: ${CHECK_INTERVAL}秒"
 log "⏳ 空闲阈值: ${MIN_IDLE_TIME}秒"
 log "📎 capture-lines: ${CAPTURE_LINES}"
+log "🧭 阶段检测: tail_lines=${STAGE_TAIL_LINES} (0=全部) | threshold=${STAGE_SCORE_THRESHOLD} | margin=${STAGE_SCORE_MARGIN}"
 log "⏳ busy-grace: ${BUSY_GRACE_S}秒"
 log "🧠 模式: LLM 监工 (model=$LLM_MODEL, role_configured=$LLM_ROLE)"
 if [ "${ORCHESTRATOR_ENABLED:-0}" = "1" ]; then
@@ -1302,7 +1540,17 @@ if [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ]; then
     MEMORY_SESSION_ID=$(python3 "${script_dir}/memory_manager.py" start-session "$TARGET" "$pane_cwd" 2>/dev/null || echo "")
     if [ -n "$MEMORY_SESSION_ID" ]; then
         log "📝 任务记忆已启用，会话ID: $MEMORY_SESSION_ID"
+        # 回写到 PID 文件，便于外部 CLI（goal/spec）定位会话上下文
+        {
+            printf "session_id=%s\n" "$MEMORY_SESSION_ID"
+            printf "pane_cwd=%s\n" "$pane_cwd"
+        } >> "$PID_FILE" 2>/dev/null || true
     fi
+fi
+
+# Agent-of-Agent：若已设置 spec.goal，则尝试预生成并激活计划（无 goal 时自动忽略）
+if [ "${AGENT_LOOP_ENABLED:-0}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+    python3 "${script_dir}/spec_manager.py" ensure-plan "$MEMORY_SESSION_ID" >/dev/null 2>&1 || true
 fi
 
 # 评估系统轮次计数（默认启用）
@@ -1326,12 +1574,12 @@ while true; do
         exit 1
     fi
 
-    update_stage_tracker "$current_output"
-
     current_time=$(date +%s)
 
     # 检查输出是否有变化
+    output_changed=0
     if [ "$current_output" != "$previous_output" ]; then
+        output_changed=1
         last_change_time=$current_time
         previous_output="$current_output"
         same_response_count=0  # 重置计数器
@@ -1340,13 +1588,20 @@ while true; do
         last_llm_output_hash_time=0
         last_llm_skip_log_hash=""
 
-        # ========== 理解层更新（输出变化时执行）==========
-        if [ "${AI_MONITOR_UNDERSTANDING_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
-            # 检测意图（从用户输入/输出中提取）
-            python3 "${script_dir}/intent_parser.py" detect "$MEMORY_SESSION_ID" "$current_output" >/dev/null 2>&1 || true
+        update_stage_tracker "$current_output" 0
 
-            # 分析错误（如果有错误信息）
-            python3 "${script_dir}/error_analyzer.py" analyze "$MEMORY_SESSION_ID" "$current_output" >/dev/null 2>&1 || true
+        # ========== 理解层更新（输出变化时执行）==========
+	        if [ "${AI_MONITOR_UNDERSTANDING_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+	            # 检测意图（从用户输入/输出中提取）
+	            python3 "${script_dir}/intent_parser.py" detect "$MEMORY_SESSION_ID" "$current_output" >/dev/null 2>&1 || true
+
+	            # Agent-of-Agent：尝试基于 intent/spec 自动生成并激活计划（无 goal 时自动忽略）
+	            if [ "${AGENT_LOOP_ENABLED:-0}" = "1" ]; then
+	                python3 "${script_dir}/spec_manager.py" ensure-plan "$MEMORY_SESSION_ID" >/dev/null 2>&1 || true
+	            fi
+
+	            # 分析错误（如果有错误信息）
+	            python3 "${script_dir}/error_analyzer.py" analyze "$MEMORY_SESSION_ID" "$current_output" >/dev/null 2>&1 || true
 
             # 更新进度（基于输出信号）
             python3 "${script_dir}/progress_monitor.py" update "$MEMORY_SESSION_ID" "$current_output" --stage "${CURRENT_STAGE:-unknown}" >/dev/null 2>&1 || true
@@ -1358,23 +1613,43 @@ while true; do
             # 记录因果事件（用于后续根因分析）
             python3 "${script_dir}/causal_tracker.py" record "$MEMORY_SESSION_ID" "output" "{\"content\":\"${current_output:0:500}\"}" >/dev/null 2>&1 || true
 
-            # 更新工作记忆（短期上下文）
-            python3 "${script_dir}/working_memory.py" add "$MEMORY_SESSION_ID" "output" "${current_output:0:1000}" >/dev/null 2>&1 || true
+	            # 更新工作记忆（短期上下文）
+	            python3 "${script_dir}/working_memory.py" add "$MEMORY_SESSION_ID" "output" "${current_output:0:1000}" >/dev/null 2>&1 || true
 
-            # 分析代码变更（如果有 git diff 变化）
-            if [ -d "${pane_cwd:-.}/.git" ]; then
-                python3 "${script_dir}/change_analyzer.py" analyze "$MEMORY_SESSION_ID" >/dev/null 2>&1 || true
-            fi
+	            # 执行器协议解析（可选）：用于闭环计划/阻塞点记录
+	            if [ "${EXECUTOR_PROTOCOL_ENABLED:-0}" = "1" ]; then
+	                python3 "${script_dir}/executor_protocol.py" update "$MEMORY_SESSION_ID" "$current_output" >/dev/null 2>&1 || true
+	            fi
+
+	            # 分析代码变更（如果有 git diff 变化）
+	            if [ -d "${pane_cwd:-.}/.git" ]; then
+	                python3 "${script_dir}/change_analyzer.py" analyze "$MEMORY_SESSION_ID" >/dev/null 2>&1 || true
+	            fi
         fi
-    else
-        idle_duration=$((current_time - last_change_time))
+	    else
+	        :
+        fi
 
-        if [ $idle_duration -ge $MIN_IDLE_TIME ]; then
-            current_output_hash="$(hash_text "$current_output" 2>/dev/null || echo "")"
-            if [ -n "$current_output_hash" ] && [ "$current_output_hash" = "$last_llm_output_hash" ]; then
-                elapsed_since_llm=$((current_time - last_llm_output_hash_time))
-                if [ "$same_response_count" -gt 0 ] && [ "$REQUERY_ON_REPEAT_AFTER" -gt 0 ] && [ "$elapsed_since_llm" -ge "$REQUERY_ON_REPEAT_AFTER" ]; then
-                    :
+        if [ "$output_changed" -eq 1 ]; then
+            :
+        else
+
+	        idle_duration=$((current_time - last_change_time))
+	        update_stage_tracker "$current_output" "$idle_duration"
+
+	        if [ $idle_duration -ge $MIN_IDLE_TIME ]; then
+	            # Agent-of-Agent：先进行一次性协议握手（避免打断执行中任务）
+	            if [ "${EXECUTOR_PROTOCOL_ENABLED:-0}" = "1" ] && [ "${EXECUTOR_PROTOCOL_BOOTSTRAP_SENT:-0}" != "1" ]; then
+	                maybe_send_executor_protocol_bootstrap
+	                sleep $CHECK_INTERVAL
+	                continue
+	            fi
+
+	            current_output_hash="$(hash_text "$current_output" 2>/dev/null || echo "")"
+	            if [ -n "$current_output_hash" ] && [ "$current_output_hash" = "$last_llm_output_hash" ]; then
+	                elapsed_since_llm=$((current_time - last_llm_output_hash_time))
+	                if [ "$same_response_count" -gt 0 ] && [ "$REQUERY_ON_REPEAT_AFTER" -gt 0 ] && [ "$elapsed_since_llm" -ge "$REQUERY_ON_REPEAT_AFTER" ]; then
+	                    :
                 elif [ "$REQUERY_SAME_OUTPUT_AFTER" -gt 0 ] && [ "$elapsed_since_llm" -ge "$REQUERY_SAME_OUTPUT_AFTER" ]; then
                     :
                 else
@@ -1420,14 +1695,19 @@ while true; do
                     fi
                 else
                     same_response_count=0
-                    log "🔄 空闲 ${idle_duration}秒，LLM 回复: '$response'"
-                    send_command "$response"
-                    last_response="$response"
-                    LAST_RESPONSE_SENT_AT="$current_time"
+	                    log "🔄 空闲 ${idle_duration}秒，LLM 回复: '$response'"
+	                    send_command "$response"
+	                    last_response="$response"
+	                    LAST_RESPONSE_SENT_AT="$current_time"
 
-                    # 记录决策到任务记忆
-                    if [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
-                        python3 "${script_dir}/memory_manager.py" record "$MEMORY_SESSION_ID" "${CURRENT_STAGE:-unknown}" "${effective_role:-monitor}" "$response" "success" 2>/dev/null || true
+	                    # Agent-of-Agent：发送动作后自动启动计划中的下一个可执行 step（若存在）
+	                    if [ "${AGENT_LOOP_ENABLED:-0}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+	                        python3 "${script_dir}/plan_generator.py" auto-start "$MEMORY_SESSION_ID" >/dev/null 2>&1 || true
+	                    fi
+
+	                    # 记录决策到任务记忆
+	                    if [ "${AI_MONITOR_MEMORY_ENABLED:-1}" = "1" ] && [ -n "${MEMORY_SESSION_ID:-}" ]; then
+	                        python3 "${script_dir}/memory_manager.py" record "$MEMORY_SESSION_ID" "${CURRENT_STAGE:-unknown}" "${effective_role:-monitor}" "$response" "success" 2>/dev/null || true
 
                         # ========== Phase 4 学习模块：决策后学习 ==========
                         # 收集隐式反馈（基于决策结果）
@@ -1468,10 +1748,10 @@ while true; do
                     fi
                 fi
             fi
-        else
-            :
+	        else
+	            :
+	        fi
         fi
-    fi
 
     sleep $CHECK_INTERVAL
 done

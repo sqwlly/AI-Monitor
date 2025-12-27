@@ -29,6 +29,19 @@ _FALLBACK_PROMPT = u"""你是一个"AI 监工/督导"，负责监管 Codex、Cla
 6) 【重要】如果 [monitor-meta] same_response_count > 0，说明你之前的回复被重复发送了，请尝试不同的指令或输出 WAIT 等待更多信息。不要机械重复同一指令。
 """
 
+_AGENT_APPENDIX = u"""
+【Agent-of-Agent 约束（必须遵守）】
+你可能会在输入里看到若干结构化块：
+- [spec] ...：用户明确设定的 Goal / DoD / Constraints / Out-of-scope；这是最高优先级约束，必须严格遵守。
+- [plan] ...：当前执行计划摘要（含 focus step）；优先推进 focus 所指的步骤，避免跑偏或做无关工作。
+- [executor] ...：执行器回传的状态摘要（来自协议块），用来判断是否真的完成/被阻塞/下一步是什么。
+
+执行策略（简化闭环）：
+1) 若存在 [spec]，你的 CMD 必须朝向满足 DoD；若信息不足，先用最小命令获取关键上下文。
+2) 若存在 [plan] 且有 focus step，优先给出推进该步骤的单行指令；若无法推进，输出 WAIT 并说明缺的关键信息。
+3) 若启用了执行器协议但长时间未看到 [executor]，可指令执行器在输出末尾追加协议块（<<<AGENT_STATUS_JSON>>>...<<<END_AGENT_STATUS_JSON>>>），并在计划步骤状态变化时填写 plan_step.event/index/result。
+"""
+
 
 def _load_role_map():
     try:
@@ -228,6 +241,11 @@ def main(argv):
         except FileNotFoundError as e:
             sys.stderr.write("%s\n" % (e,))
             system_prompt = DEFAULT_SYSTEM_PROMPT
+
+    # 统一追加 Agent-of-Agent 附录（可通过环境变量关闭）
+    if os.environ.get("AI_MONITOR_PROMPT_APPENDIX_ENABLED", "1") != "0":
+        if _AGENT_APPENDIX.strip() not in system_prompt:
+            system_prompt = (system_prompt.rstrip() + u"\n\n" + _AGENT_APPENDIX.strip() + u"\n")
 
     pane_output = _read_stdin_text()
     user_content = u"当前角色: %s\n\n被监控 AI 最近输出如下（原样）：\n\n%s" % (role_display, pane_output)

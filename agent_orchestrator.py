@@ -373,6 +373,53 @@ class Orchestrator:
 
         return pipeline.execute(context)
 
+    def run_with_primary_role(self, context, pipeline_name=None, stage=None, primary_role=None):
+        """
+        主入口（增强版）：在所选流水线基础上插入一个“主角色”Agent。
+        目的：当外部显式选择了 persona（如 ui-designer）时，即使启用 vote/sequential 也能让该 persona 参与决策。
+        """
+        pipeline = self.select_pipeline(pipeline_name, stage)
+        if not pipeline:
+            return PipelineResult([], "WAIT", "No pipeline found")
+
+        role = (primary_role or "").strip().lower()
+        if not role:
+            return pipeline.execute(context)
+
+        agents_cfg = []
+        agents_cfg.append(
+            {
+                "id": "primary-{}".format(role.replace(" ", "_")[:24] or "role"),
+                "role": role,
+                "priority": 100,
+                "enabled": True,
+            }
+        )
+
+        for a in pipeline.agents:
+            a_role = (getattr(a, "role", "") or "").strip().lower()
+            if a_role == role:
+                continue
+            agents_cfg.append(
+                {
+                    "id": getattr(a, "id", None) or "agent",
+                    "role": getattr(a, "role", None) or "monitor",
+                    "model": getattr(a, "model", None),
+                    "priority": getattr(a, "priority", 50),
+                    "enabled": getattr(a, "enabled", True),
+                }
+            )
+
+        injected = Pipeline(
+            {
+                "name": "{}+primary({})".format(pipeline.name, role),
+                "mode": pipeline.mode,
+                "agents": agents_cfg,
+                "timeout_per_agent_s": pipeline.timeout,
+            }
+        )
+        return injected.execute(context)
+
     def list_pipelines(self):
         """列出所有流水线"""
         result = []
@@ -411,6 +458,13 @@ class Orchestrator:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
 
+def _read_stdin_context() -> str:
+    data = sys.stdin.buffer.read()
+    if not data:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
 # ==================== CLI 入口 ====================
 
 def main(argv=None):
@@ -425,6 +479,7 @@ def main(argv=None):
     p_run.add_argument('--context', help='Context string (or read from stdin)')
     p_run.add_argument('--pipeline', default=DEFAULT_PIPELINE, help='Pipeline name')
     p_run.add_argument('--stage', help='Current stage (for auto pipeline selection)')
+    p_run.add_argument('--primary-role', help='Inject a primary role agent into selected pipeline')
     p_run.add_argument('--output', choices=['full', 'response'], default='response',
                       help='Output format')
 
@@ -447,10 +502,13 @@ def main(argv=None):
             if args.context:
                 context = args.context
             else:
-                context = sys.stdin.read()
+                context = _read_stdin_context()
 
             # 执行
-            result = orchestrator.run(context, args.pipeline, args.stage)
+            if args.primary_role:
+                result = orchestrator.run_with_primary_role(context, args.pipeline, args.stage, args.primary_role)
+            else:
+                result = orchestrator.run(context, args.pipeline, args.stage)
 
             if args.output == 'full':
                 print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))

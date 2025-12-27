@@ -302,6 +302,24 @@ class MemoryManager:
 
             return [dict(row) for row in rows]
 
+    def resolve_active_session_id(self, target: str) -> Optional[str]:
+        """根据 tmux target 解析当前 active session_id（用于外部工具联动）"""
+        target = (target or "").strip()
+        if not target:
+            return None
+
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT session_id
+                FROM sessions
+                WHERE target = ? AND status = 'active'
+                ORDER BY start_time DESC
+                LIMIT 1
+            """, (target,)).fetchone()
+            if row:
+                return row["session_id"]
+        return None
+
     # ==================== 决策记录 ====================
 
     def record_decision(
@@ -697,6 +715,10 @@ def main(argv=None):
     p_list.add_argument('--status', choices=['active', 'completed', 'failed', 'all'], default='all')
     p_list.add_argument('--limit', type=int, default=20)
 
+    # resolve-session
+    p_resolve = subparsers.add_parser('resolve-session', help='Resolve active session_id for a tmux target')
+    p_resolve.add_argument('target', help='tmux target (e.g., 5:node.0)')
+
     # export
     p_export = subparsers.add_parser('export', help='Export session data')
     p_export.add_argument('session_id', help='Session ID')
@@ -753,6 +775,13 @@ def main(argv=None):
                     uptime = f" ({int(time.time()) - s['start_time']}s)"
                 print(f"{status_icon} {s['session_id']} | {s['target']} | {s['last_stage'] or '-'} | "
                       f"cmds:{s['total_commands']} waits:{s['total_waits']}{uptime}")
+
+        elif args.command == 'resolve-session':
+            session_id = mm.resolve_active_session_id(args.target)
+            if session_id:
+                print(session_id)
+            else:
+                print("")
 
         elif args.command == 'export':
             data = mm.export_session(args.session_id, args.format)
