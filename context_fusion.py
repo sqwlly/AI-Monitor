@@ -74,14 +74,17 @@ PRIORITY_CONFIG = {
     SourceType.PROJECT_CONTEXT: Priority.BACKGROUND,
 }
 
-# 各来源的 Token 预算比例
+# 各来源的 Token 预算比例（优化后更激进）
 TOKEN_BUDGET_RATIO = {
-    Priority.CRITICAL: 0.30,    # 30% 给关键信息
-    Priority.HIGH: 0.25,        # 25% 给高优先级
-    Priority.MEDIUM: 0.25,      # 25% 给中优先级
-    Priority.LOW: 0.15,         # 15% 给低优先级
+    Priority.CRITICAL: 0.35,    # 35% 给关键信息
+    Priority.HIGH: 0.30,        # 30% 给高优先级
+    Priority.MEDIUM: 0.20,      # 20% 给中优先级
+    Priority.LOW: 0.10,         # 10% 给低优先级
     Priority.BACKGROUND: 0.05,  # 5% 给背景信息
 }
+
+# 默认token预算（从2000降到1200）
+DEFAULT_MAX_TOKENS = int(os.environ.get("AI_MONITOR_CONTEXT_MAX_TOKENS", "1200"))
 
 
 @dataclass
@@ -290,11 +293,14 @@ class ContextFusion:
                 item.relevance_score,
             ))
 
-    def build_context(self, session_id: str, max_tokens: int = 2000,
+    def build_context(self, session_id: str, max_tokens: int = None,
                      current_intent: str = "") -> FusedContext:
         """构建融合上下文"""
-        # 获取所有相关项
-        items = self._get_recent_items(session_id, limit=100)
+        if max_tokens is None:
+            max_tokens = DEFAULT_MAX_TOKENS
+
+        # 获取所有相关项（减少到50条）
+        items = self._get_recent_items(session_id, limit=50)
 
         # 计算相关度
         if current_intent:
@@ -357,17 +363,41 @@ class ContextFusion:
         ))
 
     def _deduplicate(self, items: List[ContextItem]) -> List[ContextItem]:
-        """去重（保留第一个出现的）"""
+        """去重（保留第一个出现的）- 增强版语义去重"""
         seen_hashes = set()
+        seen_patterns = {}  # 语义模式去重
         result = []
 
         for item in items:
             h = item.content_hash()
-            if h not in seen_hashes:
-                seen_hashes.add(h)
-                result.append(item)
+            if h in seen_hashes:
+                continue
+
+            # 语义模式去重：提取关键特征
+            pattern = self._extract_pattern(item.content)
+            if pattern in seen_patterns:
+                # 相似内容，只保留优先级更高或更新的
+                existing = seen_patterns[pattern]
+                if item.priority.value < existing.priority.value or item.timestamp > existing.timestamp:
+                    result.remove(existing)
+                    result.append(item)
+                    seen_patterns[pattern] = item
+                continue
+
+            seen_hashes.add(h)
+            seen_patterns[pattern] = item
+            result.append(item)
 
         return result
+
+    def _extract_pattern(self, content: str) -> str:
+        """提取内容的语义模式（用于去重）"""
+        # 取前100字符，去除数字和时间戳
+        pattern = content[:100]
+        pattern = re.sub(r'\d+', 'N', pattern)
+        pattern = re.sub(r'\d{2}:\d{2}:\d{2}', 'TIME', pattern)
+        pattern = re.sub(r'\s+', ' ', pattern).strip()
+        return pattern
 
     def _allocate_budget(self, items: List[ContextItem], max_tokens: int) -> List[ContextItem]:
         """按优先级分配 token 预算"""

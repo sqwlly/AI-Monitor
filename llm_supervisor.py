@@ -15,6 +15,10 @@ import urllib.request
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 ROLES_MANIFEST = os.path.join(PROMPTS_DIR, "roles.json")
 DEFAULT_ROLE = "monitor"
+
+# Token优化：启用动态Prompt
+DYNAMIC_PROMPT_ENABLED = os.environ.get("AI_MONITOR_DYNAMIC_PROMPT", "1") == "1"
+
 _FALLBACK_PROMPT = u"""你是一个"AI 监工/督导"，负责监管 Codex、Claude Code 等开发环境，确保它们在 tmux 面板里持续推进任务。
 
 请根据近期输出（多行文本）决定是否要发送"一条单行命令"。你必须谨慎克制，除非明确需要，否则宁可回复 WAIT。
@@ -29,17 +33,12 @@ _FALLBACK_PROMPT = u"""你是一个"AI 监工/督导"，负责监管 Codex、Cla
 6) 【重要】如果 [monitor-meta] same_response_count > 0，说明你之前的回复被重复发送了，请尝试不同的指令或输出 WAIT 等待更多信息。不要机械重复同一指令。
 """
 
+# 精简版Agent附录（减少token）
 _AGENT_APPENDIX = u"""
-【Agent-of-Agent 约束（必须遵守）】
-你可能会在输入里看到若干结构化块：
-- [spec] ...：用户明确设定的 Goal / DoD / Constraints / Out-of-scope；这是最高优先级约束，必须严格遵守。
-- [plan] ...：当前执行计划摘要（含 focus step）；优先推进 focus 所指的步骤，避免跑偏或做无关工作。
-- [executor] ...：执行器回传的状态摘要（来自协议块），用来判断是否真的完成/被阻塞/下一步是什么。
-
-执行策略（简化闭环）：
-1) 若存在 [spec]，你的 CMD 必须朝向满足 DoD；若信息不足，先用最小命令获取关键上下文。
-2) 若存在 [plan] 且有 focus step，优先给出推进该步骤的单行指令；若无法推进，输出 WAIT 并说明缺的关键信息。
-3) 若启用了执行器协议但长时间未看到 [executor]，可指令执行器在输出末尾追加协议块（<<<AGENT_STATUS_JSON>>>...<<<END_AGENT_STATUS_JSON>>>），并在计划步骤状态变化时填写 plan_step.event/index/result。
+【Agent约束】
+- [spec]：Goal/DoD/Constraints，最高优先级
+- [plan]：当前计划，优先推进focus步骤
+- 若信息不足，先用最小命令获取上下文
 """
 
 
@@ -53,8 +52,19 @@ def _load_role_map():
         return {}
 
 
-def _load_role_prompt(role_name):
+def _load_role_prompt(role_name, context=""):
+    """加载角色提示词，支持动态Prompt优化"""
     role = (role_name or "monitor").strip().lower()
+
+    # 尝试使用动态Prompt构建器
+    if DYNAMIC_PROMPT_ENABLED:
+        try:
+            from prompt_builder import build_dynamic_prompt
+            return build_dynamic_prompt(role, context)
+        except ImportError:
+            pass  # 回退到静态prompt
+
+    # 静态prompt加载
     role_file = os.path.join(PROMPTS_DIR, f"{role}.txt")
     if os.path.isfile(role_file):
         with open(role_file, "r", encoding="utf-8") as f:
@@ -229,6 +239,9 @@ def main(argv):
     if normalized_role == "auto":
         role_display = "auto (LLM 自选角色)"
 
+    # 先读取输入，用于动态Prompt构建
+    pane_output = _read_stdin_text()
+
     if args.system_prompt_file:
         with open(args.system_prompt_file, "r", encoding="utf-8") as f:
             system_prompt = f.read()
@@ -237,7 +250,8 @@ def main(argv):
             if normalized_role == "auto":
                 system_prompt = _compose_auto_prompt()
             else:
-                system_prompt = _load_role_prompt(normalized_role)
+                # 传入context用于动态Prompt优化
+                system_prompt = _load_role_prompt(normalized_role, pane_output)
         except FileNotFoundError as e:
             sys.stderr.write("%s\n" % (e,))
             system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -247,7 +261,6 @@ def main(argv):
         if _AGENT_APPENDIX.strip() not in system_prompt:
             system_prompt = (system_prompt.rstrip() + u"\n\n" + _AGENT_APPENDIX.strip() + u"\n")
 
-    pane_output = _read_stdin_text()
     user_content = u"当前角色: %s\n\n被监控 AI 最近输出如下（原样）：\n\n%s" % (role_display, pane_output)
 
     # 动态 Temperature：重复次数越多，随机性越高

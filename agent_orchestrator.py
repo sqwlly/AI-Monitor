@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Claude Monitor Agent Orchestrator
-多Agent编排系统 - 投票模式实现
+多Agent编排系统 - 投票模式实现（含Token优化）
 
 Usage:
     python3 agent_orchestrator.py run --context <context> [--pipeline vote|default] [--stage <stage>]
@@ -12,11 +12,13 @@ Usage:
 Pipeline Modes:
     default  - 单Agent模式（使用默认监工）
     vote     - 投票模式（并行调用多个Agent，多数投票决策）
+    tiered   - 分层模式（快速预判 + 按需完整分析）
 
 Environment Variables:
     AI_MONITOR_ORCHESTRATOR_ENABLED  - 启用编排器 (0/1)
-    AI_MONITOR_PIPELINE              - 默认流水线 (default/vote)
+    AI_MONITOR_PIPELINE              - 默认流水线 (default/vote/tiered)
     AI_MONITOR_PIPELINE_CONFIG       - 流水线配置文件路径
+    AI_MONITOR_TOKEN_OPTIMIZE        - 启用token优化 (0/1, 默认1)
 """
 
 import argparse
@@ -29,7 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 try:
-    from typing import Optional, List, Dict, Any
+    from typing import Optional, List, Dict, Any, Tuple
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 except ImportError:
     pass
@@ -42,7 +44,46 @@ SCRIPT_DIR = Path(__file__).parent
 # 环境变量
 CONFIG_PATH = Path(os.environ.get("AI_MONITOR_PIPELINE_CONFIG", str(DEFAULT_CONFIG_PATH)))
 ORCHESTRATOR_ENABLED = os.environ.get("AI_MONITOR_ORCHESTRATOR_ENABLED", "0") == "1"
-DEFAULT_PIPELINE = os.environ.get("AI_MONITOR_PIPELINE", "default")
+DEFAULT_PIPELINE = os.environ.get("AI_MONITOR_PIPELINE", "tiered")  # 默认使用分层模式
+TOKEN_OPTIMIZE_ENABLED = os.environ.get("AI_MONITOR_TOKEN_OPTIMIZE", "1") == "1"
+
+# Token优化组件（延迟导入）
+_tiered_executor = None
+_output_filter = None
+_response_cache = None
+
+
+def _get_tiered_executor():
+    global _tiered_executor
+    if _tiered_executor is None:
+        try:
+            from token_optimizer import get_tiered_executor
+            _tiered_executor = get_tiered_executor()
+        except ImportError:
+            _tiered_executor = False
+    return _tiered_executor if _tiered_executor else None
+
+
+def _get_output_filter():
+    global _output_filter
+    if _output_filter is None:
+        try:
+            from token_optimizer import get_output_filter
+            _output_filter = get_output_filter()
+        except ImportError:
+            _output_filter = False
+    return _output_filter if _output_filter else None
+
+
+def _get_response_cache():
+    global _response_cache
+    if _response_cache is None:
+        try:
+            from token_optimizer import get_response_cache
+            _response_cache = get_response_cache()
+        except ImportError:
+            _response_cache = False
+    return _response_cache if _response_cache else None
 
 
 class AgentResponse:
@@ -156,18 +197,65 @@ class Pipeline:
 
     def __init__(self, config):
         self.name = config.get('name', 'default')
-        self.mode = config.get('mode', 'single')  # single/vote/sequential
+        self.mode = config.get('mode', 'single')  # single/vote/sequential/tiered
         self.agents = [Agent(a) for a in config.get('agents', [])]
         self.timeout = config.get('timeout_per_agent_s', 15)
 
     def execute(self, context):
         """执行流水线"""
-        if self.mode == 'vote':
+        # Token优化：先过滤输出
+        if TOKEN_OPTIMIZE_ENABLED:
+            output_filter = _get_output_filter()
+            if output_filter:
+                context = output_filter.filter(context)
+                context = output_filter.fold_repetitive(context)
+
+        if self.mode == 'tiered':
+            return self._execute_tiered(context)
+        elif self.mode == 'vote':
             return self._execute_vote(context)
         elif self.mode == 'sequential':
             return self._execute_sequential(context)
         else:  # single
             return self._execute_single(context)
+
+    def _execute_tiered(self, context):
+        """分层模式：快速预判 + 按需完整分析"""
+        # 1. 尝试快速分类
+        if TOKEN_OPTIMIZE_ENABLED:
+            tiered = _get_tiered_executor()
+            if tiered:
+                need_full, quick_response = tiered.should_invoke_full_agent(context)
+                if not need_full and quick_response:
+                    return PipelineResult(
+                        [],
+                        quick_response,
+                        "Tiered: quick classification (no LLM call)"
+                    )
+
+        # 2. 检查缓存
+        if TOKEN_OPTIMIZE_ENABLED and self.agents:
+            cache = _get_response_cache()
+            if cache:
+                cached = cache.get(context, self.agents[0].role)
+                if cached:
+                    response, stage = cached
+                    return PipelineResult(
+                        [],
+                        response,
+                        "Tiered: cache hit"
+                    )
+
+        # 3. 需要完整分析，使用单agent模式
+        result = self._execute_single(context)
+
+        # 4. 缓存结果
+        if TOKEN_OPTIMIZE_ENABLED and result.final_response:
+            cache = _get_response_cache()
+            if cache and self.agents:
+                cache.set(context, self.agents[0].role, result.final_response)
+
+        return result
 
     def _execute_single(self, context):
         """单Agent模式"""
@@ -324,6 +412,12 @@ class Orchestrator:
             "default": {
                 "name": "single-monitor",
                 "mode": "single",
+                "agents": [{"id": "monitor-1", "role": "monitor"}],
+                "timeout_per_agent_s": 15
+            },
+            "tiered": {
+                "name": "tiered-optimized",
+                "mode": "tiered",
                 "agents": [{"id": "monitor-1", "role": "monitor"}],
                 "timeout_per_agent_s": 15
             },
