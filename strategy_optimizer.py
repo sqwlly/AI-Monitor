@@ -919,7 +919,8 @@ class StrategyOptimizer:
 
 # ==================== CLI Interface ====================
 
-def main():
+def _parse_args():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Claude Monitor Strategy Optimizer"
     )
@@ -963,80 +964,117 @@ def main():
     record_parser.add_argument("action", help="Action taken")
     record_parser.add_argument("outcome", choices=["success", "failure", "wait"], help="Outcome")
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _cmd_evaluate(optimizer, args):
+    """Handle evaluate command"""
+    evaluation = optimizer.evaluate(args.strategy_id)
+    print(json.dumps(evaluation.to_dict(), indent=2))
+
+
+def _cmd_adjust(optimizer, args):
+    """Handle adjust command"""
+    feedback = json.loads(args.feedback) if args.feedback else None
+    strategy = optimizer.adjust(args.strategy_id, feedback)
+    print(json.dumps(strategy.to_dict(), indent=2))
+
+
+def _cmd_compare(optimizer, args):
+    """Handle compare command"""
+    result = optimizer.compare(args.strategy_a, args.strategy_b)
+    print(json.dumps(result.to_dict(), indent=2))
+
+
+def _cmd_recommend(optimizer, args):
+    """Handle recommend command"""
+    context = json.loads(args.context) if args.context else {}
+    strategies = optimizer.recommend(context)
+    print(json.dumps([s.to_dict() for s in strategies], indent=2))
+
+
+def _cmd_decay_check(optimizer, args):
+    """Handle decay-check command"""
+    decaying = optimizer.check_decay(args.threshold)
+    print(json.dumps(decaying, indent=2))
+
+
+def _cmd_list(optimizer, args):
+    """Handle list command"""
+    with optimizer._get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM strategies ORDER BY status, confidence DESC"
+        ).fetchall()
+        strategies = [optimizer._row_to_strategy(r).to_dict() for r in rows]
+        print(json.dumps(strategies, indent=2))
+
+
+def _cmd_suggest(optimizer, args):
+    """Handle suggest command"""
+    # 根据阶段查找最佳策略
+    context = {"stage": args.stage}
+    strategies = optimizer.recommend(context)
+    if strategies:
+        best = strategies[0]
+        # 输出简洁建议供 shell 使用
+        print(f"推荐策略: {best.name} (confidence={best.confidence:.2f})")
+    # 无输出表示无建议
+
+
+def _cmd_record(optimizer, args):
+    """Handle record command"""
+    # 查找或创建对应阶段的策略
+    strategy_id = f"stage_{args.stage}"
+    with optimizer._get_conn() as conn:
+        existing = conn.execute(
+            "SELECT strategy_id FROM strategies WHERE strategy_id = ?",
+            (strategy_id,)
+        ).fetchone()
+
+        if not existing:
+            # 创建新策略
+            conn.execute("""
+                INSERT INTO strategies (
+                    strategy_id, name, description, context_tags, status,
+                    confidence, total_uses, success_count, failure_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'active', 0.5, 0, 0, 0, ?, ?)
+            """, (
+                strategy_id,
+                f"Stage {args.stage} strategy",
+                f"Auto-created strategy for {args.stage} stage",
+                json.dumps([args.stage]),
+                int(time.time()),
+                int(time.time())
+            ))
+
+    # 记录使用结果
+    optimizer.record_usage(strategy_id, args.action, args.outcome)
+
+
+def main():
+    """Main entry point"""
+    args = _parse_args()
     optimizer = StrategyOptimizer()
 
     if args.command == "evaluate":
-        evaluation = optimizer.evaluate(args.strategy_id)
-        print(json.dumps(evaluation.to_dict(), indent=2))
-
+        _cmd_evaluate(optimizer, args)
     elif args.command == "adjust":
-        feedback = json.loads(args.feedback) if args.feedback else None
-        strategy = optimizer.adjust(args.strategy_id, feedback)
-        print(json.dumps(strategy.to_dict(), indent=2))
-
+        _cmd_adjust(optimizer, args)
     elif args.command == "compare":
-        result = optimizer.compare(args.strategy_a, args.strategy_b)
-        print(json.dumps(result.to_dict(), indent=2))
-
+        _cmd_compare(optimizer, args)
     elif args.command == "recommend":
-        context = json.loads(args.context) if args.context else {}
-        strategies = optimizer.recommend(context)
-        print(json.dumps([s.to_dict() for s in strategies], indent=2))
-
+        _cmd_recommend(optimizer, args)
     elif args.command == "decay-check":
-        decaying = optimizer.check_decay(args.threshold)
-        print(json.dumps(decaying, indent=2))
-
+        _cmd_decay_check(optimizer, args)
     elif args.command == "list":
-        with optimizer._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM strategies ORDER BY status, confidence DESC"
-            ).fetchall()
-            strategies = [optimizer._row_to_strategy(r).to_dict() for r in rows]
-            print(json.dumps(strategies, indent=2))
-
+        _cmd_list(optimizer, args)
     elif args.command == "suggest":
-        # 根据阶段查找最佳策略
-        context = {"stage": args.stage}
-        strategies = optimizer.recommend(context)
-        if strategies:
-            best = strategies[0]
-            # 输出简洁建议供 shell 使用
-            print(f"推荐策略: {best.name} (confidence={best.confidence:.2f})")
-        # 无输出表示无建议
-
+        _cmd_suggest(optimizer, args)
     elif args.command == "record":
-        # 查找或创建对应阶段的策略
-        strategy_id = f"stage_{args.stage}"
-        with optimizer._get_conn() as conn:
-            existing = conn.execute(
-                "SELECT strategy_id FROM strategies WHERE strategy_id = ?",
-                (strategy_id,)
-            ).fetchone()
-
-            if not existing:
-                # 创建新策略
-                conn.execute("""
-                    INSERT INTO strategies (
-                        strategy_id, name, description, context_tags, status,
-                        confidence, total_uses, success_count, failure_count,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'active', 0.5, 0, 0, 0, ?, ?)
-                """, (
-                    strategy_id,
-                    f"Stage {args.stage} strategy",
-                    f"Auto-created strategy for {args.stage} stage",
-                    json.dumps([args.stage]),
-                    int(time.time()),
-                    int(time.time())
-                ))
-
-        # 记录使用结果
-        optimizer.record_usage(strategy_id, args.action, args.outcome)
-
+        _cmd_record(optimizer, args)
     else:
-        parser.print_help()
+        _parse_args().parse_args(["--help"])
 
 
 if __name__ == "__main__":

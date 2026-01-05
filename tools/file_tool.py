@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Claude Monitor File Tool
-文件系统工具 - 安全的文件操作
+File system tool with secure file operations
 
-功能：
-1. 文件读取（指定文件/行范围/内容搜索）
-2. 文件分析（代码结构/依赖关系/变更影响）
-3. 文件操作建议（只生成建议/diff/命令序列）
-4. 安全控制（只读模式/敏感文件保护/操作审计）
+Features:
+1. File reading (specific files/line ranges/content search)
+2. File analysis (code structure/dependencies/impact)
+3. File operation suggestions (suggestions only/diff/command sequences)
+4. Security controls (read-only mode/sensitive file protection/audit)
 """
 
 import hashlib
@@ -22,6 +22,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import core security modules
+from core.validators import PathValidator
+from core.exceptions import ValidationError
 
 try:
     from tool_dispatcher import BaseTool, ToolSpec, ToolCategory, ToolPermission
@@ -54,7 +58,7 @@ except ImportError:
 class FileTool(BaseTool):
     """File system tool with safety restrictions"""
 
-    # Protected paths that cannot be read
+    # Protected paths that cannot be read (deprecated, using PathValidator)
     PROTECTED_PATHS = [
         "/etc/shadow", "/etc/passwd", "/etc/sudoers",
         ".env", ".ssh", "credentials", "secrets",
@@ -66,6 +70,9 @@ class FileTool(BaseTool):
 
     # Maximum lines to return
     MAX_LINES = 1000
+
+    # Optional: restrict access to specific directory
+    BASE_DIRECTORY = None  # Set to restrict file access
 
     @property
     def spec(self) -> ToolSpec:
@@ -150,11 +157,25 @@ class FileTool(BaseTool):
             return {"success": False, "error": f"Unknown action: {action}"}
 
     def _is_safe_path(self, path: str) -> bool:
-        """Check if path is safe to access"""
-        path_lower = path.lower()
-        for protected in self.PROTECTED_PATHS:
-            if protected.lower() in path_lower:
-                return False
+        """
+        Check if path is safe to access
+
+        Enhanced security:
+        1. Path normalization
+        2. Path traversal detection
+        3. Protected path checking
+        4. Symlink blocking
+        """
+        # Use PathValidator for enhanced security
+        is_safe, error_msg = PathValidator.is_safe_path(
+            path,
+            base_dir=self.BASE_DIRECTORY
+        )
+
+        if not is_safe:
+            sys.stderr.write(f"[file_tool] Path blocked: {error_msg}\n")
+            return False
+
         return True
 
     def _read_file(self, path: Path) -> Dict[str, Any]:
@@ -285,7 +306,7 @@ class FileTool(BaseTool):
                 try:
                     with open(path, "r", errors="replace") as f:
                         info["lines"] = sum(1 for _ in f)
-                except:
+                except (IOError, UnicodeDecodeError):
                     pass
 
                 # Get file extension

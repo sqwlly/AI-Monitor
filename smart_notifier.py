@@ -408,7 +408,7 @@ class SmartNotifier:
                     capture_output=True,
                     timeout=5
                 )
-            except:
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 pass
 
         elif sys.platform.startswith("linux"):
@@ -426,7 +426,7 @@ class SmartNotifier:
                     capture_output=True,
                     timeout=5
                 )
-            except:
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 pass
 
     def _send_terminal(self, notification: Notification):
@@ -446,7 +446,7 @@ class SmartNotifier:
                     capture_output=True,
                     timeout=5
                 )
-            except:
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 pass
         else:
             # Linux - try paplay
@@ -456,7 +456,7 @@ class SmartNotifier:
                     capture_output=True,
                     timeout=5
                 )
-            except:
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 pass
 
     def _send_log(self, notification: Notification):

@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +32,11 @@ from compat_dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+
+# 导入核心安全模块
+from core.security import CommandValidator
+from core.exceptions import ToolError, SecurityError
+from base import DataClassMixin
 
 # Database path
 DEFAULT_DB_DIR = Path.home() / ".tmux-monitor" / "memory"
@@ -572,7 +578,7 @@ class ShellTool(BaseTool):
             priority=60,
         )
 
-    # Commands that are blocked for safety
+    # Commands that are blocked for safety (deprecated, using CommandValidator instead)
     BLOCKED_PATTERNS = [
         "rm -rf", "rm -r /", "dd if=", "> /dev/",
         "mkfs", "fdisk", "format",
@@ -586,16 +592,37 @@ class ShellTool(BaseTool):
         cwd: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        # Safety check
-        cmd_lower = command.lower()
-        for pattern in self.BLOCKED_PATTERNS:
-            if pattern in cmd_lower:
-                raise ValueError(f"Blocked dangerous command pattern: {pattern}")
+        """
+        执行shell命令（安全模式）
+
+        安全改进：
+        1. 移除 shell=True，使用参数列表执行
+        2. 使用 CommandValidator 进行安全验证
+        3. 限制可执行的命令类型
+
+        Args:
+            command: 要执行的命令
+            timeout: 超时时间（秒）
+            cwd: 工作目录
+
+        Returns:
+            包含 stdout, stderr, returncode 的字典
+        """
+        # 使用 CommandValidator 进行安全验证
+        is_safe, error_msg = CommandValidator.validate(command)
+        if not is_safe:
+            raise SecurityError(f"命令安全验证失败: {error_msg}")
+
+        # 安全解析命令为参数列表
+        cmd_parts = CommandValidator.parse_command(command)
+        if cmd_parts is None:
+            raise SecurityError("命令解析失败")
 
         try:
+            # 使用参数列表执行，不使用 shell=True
             result = subprocess.run(
-                command,
-                shell=True,
+                cmd_parts,  # 参数列表而非字符串
+                shell=False,  # 移除 shell=True
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -611,6 +638,12 @@ class ShellTool(BaseTool):
                 "stdout": "",
                 "stderr": f"Command timed out after {timeout}s",
                 "returncode": -1,
+            }
+        except FileNotFoundError:
+            return {
+                "stdout": "",
+                "stderr": f"Command not found: {cmd_parts[0]}",
+                "returncode": -2,
             }
 
 

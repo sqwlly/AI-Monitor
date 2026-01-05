@@ -920,7 +920,8 @@ class PlanGenerator:
 
 # ==================== CLI Interface ====================
 
-def main():
+def _parse_args():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Claude Monitor Plan Generator"
     )
@@ -970,118 +971,159 @@ def main():
     auto_start_parser = subparsers.add_parser("auto-start", help="Auto start next step for active plan")
     auto_start_parser.add_argument("session_id", help="Session ID")
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _cmd_generate(generator, args):
+    """Handle generate command"""
+    constraints = json.loads(args.constraints) if args.constraints else {}
+    plan = generator.generate(args.session_id, args.goal, constraints)
+    print(json.dumps(plan.to_dict(), indent=2))
+
+
+def _cmd_validate(generator, args):
+    """Handle validate command"""
+    result = generator.validate(args.plan_id)
+    print(json.dumps(result.to_dict(), indent=2))
+
+
+def _cmd_track(generator, args):
+    """Handle track command"""
+    tracking = generator.track(args.plan_id)
+    print(json.dumps(tracking, indent=2))
+
+
+def _cmd_adjust(generator, args):
+    """Handle adjust command"""
+    adjustments = json.loads(args.adjustments) if args.adjustments else {}
+    plan = generator.adjust(args.plan_id, args.reason, adjustments)
+    print(json.dumps(plan.to_dict(), indent=2))
+
+
+def _cmd_complete(generator, args):
+    """Handle complete command"""
+    step = generator.complete_step(args.plan_id, args.step_index, args.result)
+    if step:
+        print(json.dumps(step.to_dict(), indent=2))
+    else:
+        print("Step not found")
+
+
+def _cmd_start_step(generator, args):
+    """Handle start-step command"""
+    step = generator.start_step(args.plan_id, args.step_index)
+    if step:
+        print(json.dumps(step.to_dict(), indent=2))
+    else:
+        print("Step not found")
+
+
+def _cmd_history(generator, args):
+    """Handle history command"""
+    history = generator.get_plan_history(args.plan_id)
+    print(json.dumps(history, indent=2))
+
+
+def _cmd_status(generator, args):
+    """Handle status command"""
+    # 查找会话当前未结束的计划（active 优先，其次 draft/paused）
+    with generator._get_conn() as conn:
+        plan_row = conn.execute("""
+            SELECT * FROM plans
+            WHERE session_id = ?
+              AND status NOT IN ('completed', 'abandoned', 'failed')
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (args.session_id,)).fetchone()
+
+        if plan_row:
+            plan = generator._row_to_plan(plan_row)
+            total_steps = len(plan.steps)
+            completed = sum(
+                1 for s in plan.steps
+                if s.status in (StepStatus.COMPLETED, StepStatus.SKIPPED)
+            )
+
+            focus_step = plan.get_current_step() or plan.get_next_step()
+            focus = None
+            if focus_step:
+                focus = {
+                    "index": focus_step.index,
+                    "title": focus_step.title,
+                    "description": focus_step.description,
+                    "step_type": focus_step.step_type.value,
+                    "status": focus_step.status.value,
+                    "action": focus_step.action,
+                    "expected_outcome": focus_step.expected_outcome,
+                }
+
+            if args.json:
+                print(json.dumps({
+                    "plan_id": plan.plan_id,
+                    "session_id": plan.session_id,
+                    "status": plan.status.value,
+                    "risk_level": plan.risk_level.value,
+                    "progress": round(plan.progress, 3),
+                    "steps_completed": completed,
+                    "steps_total": total_steps,
+                    "focus_step": focus,
+                }, ensure_ascii=False))
+            else:
+                status_line = f"[plan] id={plan.plan_id} status={plan.status.value} progress={completed}/{total_steps}"
+                if focus_step:
+                    status_line += f" | focus={focus_step.index}:{focus_step.title}"
+                status_line += f" | risk={plan.risk_level.value}"
+                print(status_line)
+
+
+def _cmd_auto_start(generator, args):
+    """Handle auto-start command"""
+    plans = generator.get_active_plans(args.session_id)
+    if not plans:
+        return
+
+    plan = plans[0]
+    if plan.get_current_step():
+        print("already_in_progress")
+        return
+
+    next_step = plan.get_next_step()
+    if not next_step:
+        print("no_executable_step")
+        return
+
+    started = generator.start_step(plan.plan_id, next_step.index)
+    if started:
+        print(f"started {plan.plan_id}#{started.index}")
+    else:
+        print("start_failed")
+
+
+def main():
+    """Main entry point"""
+    args = _parse_args()
     generator = PlanGenerator()
 
     if args.command == "generate":
-        constraints = json.loads(args.constraints) if args.constraints else {}
-        plan = generator.generate(args.session_id, args.goal, constraints)
-        print(json.dumps(plan.to_dict(), indent=2))
-
+        _cmd_generate(generator, args)
     elif args.command == "validate":
-        result = generator.validate(args.plan_id)
-        print(json.dumps(result.to_dict(), indent=2))
-
+        _cmd_validate(generator, args)
     elif args.command == "track":
-        tracking = generator.track(args.plan_id)
-        print(json.dumps(tracking, indent=2))
-
+        _cmd_track(generator, args)
     elif args.command == "adjust":
-        adjustments = json.loads(args.adjustments) if args.adjustments else {}
-        plan = generator.adjust(args.plan_id, args.reason, adjustments)
-        print(json.dumps(plan.to_dict(), indent=2))
-
+        _cmd_adjust(generator, args)
     elif args.command == "complete":
-        step = generator.complete_step(args.plan_id, args.step_index, args.result)
-        if step:
-            print(json.dumps(step.to_dict(), indent=2))
-        else:
-            print("Step not found")
-
+        _cmd_complete(generator, args)
     elif args.command == "start-step":
-        step = generator.start_step(args.plan_id, args.step_index)
-        if step:
-            print(json.dumps(step.to_dict(), indent=2))
-        else:
-            print("Step not found")
-
+        _cmd_start_step(generator, args)
     elif args.command == "history":
-        history = generator.get_plan_history(args.plan_id)
-        print(json.dumps(history, indent=2))
-
+        _cmd_history(generator, args)
     elif args.command == "status":
-        # 查找会话当前未结束的计划（active 优先，其次 draft/paused）
-        with generator._get_conn() as conn:
-            plan_row = conn.execute("""
-                SELECT * FROM plans
-                WHERE session_id = ?
-                  AND status NOT IN ('completed', 'abandoned', 'failed')
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, (args.session_id,)).fetchone()
-
-            if plan_row:
-                plan = generator._row_to_plan(plan_row)
-                total_steps = len(plan.steps)
-                completed = sum(
-                    1 for s in plan.steps
-                    if s.status in (StepStatus.COMPLETED, StepStatus.SKIPPED)
-                )
-
-                focus_step = plan.get_current_step() or plan.get_next_step()
-                focus = None
-                if focus_step:
-                    focus = {
-                        "index": focus_step.index,
-                        "title": focus_step.title,
-                        "description": focus_step.description,
-                        "step_type": focus_step.step_type.value,
-                        "status": focus_step.status.value,
-                        "action": focus_step.action,
-                        "expected_outcome": focus_step.expected_outcome,
-                    }
-
-                if args.json:
-                    print(json.dumps({
-                        "plan_id": plan.plan_id,
-                        "session_id": plan.session_id,
-                        "status": plan.status.value,
-                        "risk_level": plan.risk_level.value,
-                        "progress": round(plan.progress, 3),
-                        "steps_completed": completed,
-                        "steps_total": total_steps,
-                        "focus_step": focus,
-                    }, ensure_ascii=False))
-                else:
-                    status_line = f"[plan] id={plan.plan_id} status={plan.status.value} progress={completed}/{total_steps}"
-                    if focus_step:
-                        status_line += f" | focus={focus_step.index}:{focus_step.title}"
-                    status_line += f" | risk={plan.risk_level.value}"
-                    print(status_line)
-
+        _cmd_status(generator, args)
     elif args.command == "auto-start":
-        plans = generator.get_active_plans(args.session_id)
-        if not plans:
-            return
-
-        plan = plans[0]
-        if plan.get_current_step():
-            print("already_in_progress")
-            return
-
-        next_step = plan.get_next_step()
-        if not next_step:
-            print("no_executable_step")
-            return
-
-        started = generator.start_step(plan.plan_id, next_step.index)
-        if started:
-            print(f"started {plan.plan_id}#{started.index}")
-        else:
-            print("start_failed")
-
+        _cmd_auto_start(generator, args)
     else:
-        parser.print_help()
+        _parse_args().parse_args(["--help"])
 
 
 if __name__ == "__main__":

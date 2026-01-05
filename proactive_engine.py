@@ -894,7 +894,8 @@ class ProactiveEngine:
 
 # ==================== CLI Interface ====================
 
-def main():
+def _parse_args():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="Claude Monitor Proactive Engine"
     )
@@ -945,70 +946,97 @@ def main():
     check_parser.add_argument("output_text", help="Current output text")
     check_parser.add_argument("--stage", default="unknown", help="Current stage")
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _cmd_analyze(engine, args):
+    """Handle analyze command"""
+    result = engine.analyze_session(args.session_id)
+    print(json.dumps(result, indent=2))
+
+
+def _cmd_should_intervene(engine, args):
+    """Handle should-intervene command"""
+    context = json.loads(args.context) if args.context else {}
+    decision = engine.should_intervene(args.session_id, context)
+    print(json.dumps(decision.to_dict(), indent=2))
+
+
+def _cmd_intervene(engine, args):
+    """Handle intervene command"""
+    intervention = engine.create_intervention(
+        session_id=args.session_id,
+        intervention_type=InterventionType(args.intervention_type),
+        trigger=InterventionTrigger.USER_REQUEST,
+        urgency=InterventionUrgency.MEDIUM,
+        message=args.message or "Intervention requested",
+    )
+    print(json.dumps(intervention.to_dict(), indent=2))
+
+
+def _cmd_record_outcome(engine, args):
+    """Handle record-outcome command"""
+    engine.record_outcome(args.intervention_id, args.outcome)
+    print(f"Recorded outcome: {args.outcome}")
+
+
+def _cmd_stats(engine, args):
+    """Handle stats command"""
+    stats = engine.get_stats(args.session)
+    print(json.dumps(stats, indent=2))
+
+
+def _cmd_recommendations(engine, args):
+    """Handle recommendations command"""
+    recommendations = engine.get_recommendations()
+    print(json.dumps(recommendations, indent=2))
+
+
+def _cmd_check(engine, args):
+    """Handle check command - quick proactive check"""
+    # 简单启发式检测
+    output_lower = args.output_text.lower()
+    suggestions = []
+
+    # 检测卡住/循环
+    if "error" in output_lower or "failed" in output_lower or "exception" in output_lower:
+        suggestions.append("[proactive] 检测到错误，建议诊断问题根因")
+
+    if "timeout" in output_lower or "timed out" in output_lower:
+        suggestions.append("[proactive] 检测到超时，建议检查网络或增加超时时间")
+
+    if "permission denied" in output_lower or "access denied" in output_lower:
+        suggestions.append("[proactive] 检测到权限问题，建议检查文件/目录权限")
+
+    if "not found" in output_lower and ("command" in output_lower or "file" in output_lower):
+        suggestions.append("[proactive] 检测到资源缺失，建议检查路径或安装依赖")
+
+    # 输出建议（每行一条，供 shell 注入）
+    if suggestions:
+        print("\n".join(suggestions[:2]))  # 最多2条建议
+
+
+def main():
+    """Main entry point"""
+    args = _parse_args()
     engine = ProactiveEngine()
 
     if args.command == "analyze":
-        result = engine.analyze_session(args.session_id)
-        print(json.dumps(result, indent=2))
-
+        _cmd_analyze(engine, args)
     elif args.command == "should-intervene":
-        context = json.loads(args.context) if args.context else {}
-        decision = engine.should_intervene(args.session_id, context)
-        print(json.dumps(decision.to_dict(), indent=2))
-
+        _cmd_should_intervene(engine, args)
     elif args.command == "intervene":
-        intervention = engine.create_intervention(
-            session_id=args.session_id,
-            intervention_type=InterventionType(args.intervention_type),
-            trigger=InterventionTrigger.USER_REQUEST,
-            urgency=InterventionUrgency.MEDIUM,
-            message=args.message or "Intervention requested",
-        )
-        print(json.dumps(intervention.to_dict(), indent=2))
-
+        _cmd_intervene(engine, args)
     elif args.command == "record-outcome":
-        engine.record_outcome(args.intervention_id, args.outcome)
-        print(f"Recorded outcome: {args.outcome}")
-
+        _cmd_record_outcome(engine, args)
     elif args.command == "stats":
-        stats = engine.get_stats(args.session)
-        print(json.dumps(stats, indent=2))
-
+        _cmd_stats(engine, args)
     elif args.command == "recommendations":
-        recommendations = engine.get_recommendations()
-        print(json.dumps(recommendations, indent=2))
-
+        _cmd_recommendations(engine, args)
     elif args.command == "check":
-        # 快速检查是否需要干预
-        context = {
-            "output": args.output_text,
-            "stage": args.stage,
-        }
-
-        # 简单启发式检测
-        output_lower = args.output_text.lower()
-        suggestions = []
-
-        # 检测卡住/循环
-        if "error" in output_lower or "failed" in output_lower or "exception" in output_lower:
-            suggestions.append("[proactive] 检测到错误，建议诊断问题根因")
-
-        if "timeout" in output_lower or "timed out" in output_lower:
-            suggestions.append("[proactive] 检测到超时，建议检查网络或增加超时时间")
-
-        if "permission denied" in output_lower or "access denied" in output_lower:
-            suggestions.append("[proactive] 检测到权限问题，建议检查文件/目录权限")
-
-        if "not found" in output_lower and ("command" in output_lower or "file" in output_lower):
-            suggestions.append("[proactive] 检测到资源缺失，建议检查路径或安装依赖")
-
-        # 输出建议（每行一条，供 shell 注入）
-        if suggestions:
-            print("\n".join(suggestions[:2]))  # 最多2条建议
-
+        _cmd_check(engine, args)
     else:
-        parser.print_help()
+        _parse_args().parse_args(["--help"])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ import sys
 import urllib.error
 import urllib.request
 
+# Import centralized configuration manager
+from config_manager import get_config
+
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 ROLES_MANIFEST = os.path.join(PROMPTS_DIR, "roles.json")
@@ -204,33 +207,43 @@ def _chat_completions(base_url, api_key, model, system_prompt, user_content, tim
 def main(argv):
     parser = argparse.ArgumentParser(description="LLM supervisor (OpenAI-compatible Chat Completions).")
 
+    # Use centralized configuration manager
+    config = get_config()
+
+    # Get LLM configuration with centralized access
     dashscope_api_key = os.environ.get("DASHSCOPE_API_KEY") or ""
-    base_url_default = os.environ.get("AI_MONITOR_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
+    base_url_default = config.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
     if not base_url_default and dashscope_api_key:
         base_url_default = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     if not base_url_default:
         base_url_default = "https://api.openai.com/v1"
 
-    api_key_default = os.environ.get("AI_MONITOR_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or dashscope_api_key or ""
+    api_key_default = config.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or dashscope_api_key or ""
 
-    model_default = os.environ.get("AI_MONITOR_LLM_MODEL") or ""
+    model_default = config.get("LLM_MODEL") or ""
     if not model_default and "dashscope.aliyuncs.com/compatible-mode" in base_url_default:
         model_default = "qwen-max"
     if not model_default:
         model_default = "gpt-4o-mini"
 
-    role_default = os.environ.get("AI_MONITOR_LLM_ROLE") or DEFAULT_ROLE
+    role_default = config.get("LLM_ROLE") or DEFAULT_ROLE
 
     parser.add_argument("--base-url", default=base_url_default)
     parser.add_argument("--api-key", default=api_key_default)
     parser.add_argument("--model", default=model_default)
     parser.add_argument("--role", default=role_default)
-    parser.add_argument("--timeout", type=float, default=float(os.environ.get("AI_MONITOR_LLM_TIMEOUT") or "20"))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("AI_MONITOR_LLM_MAX_TOKENS") or "80"))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("AI_MONITOR_LLM_TEMPERATURE") or "0.5"))
+    parser.add_argument("--timeout", type=float, default=float(config.get("LLM_TIMEOUT", "20")))
+    parser.add_argument("--max-tokens", type=int, default=int(config.get("LLM_MAX_TOKENS", "80")))
+    parser.add_argument("--temperature", type=float, default=float(config.get("LLM_TEMPERATURE", "0.5")))
     parser.add_argument("--same-response-count", type=int, default=0, help="用于动态调整 temperature")
-    parser.add_argument("--system-prompt-file", default=os.environ.get("AI_MONITOR_LLM_SYSTEM_PROMPT_FILE") or "")
+    parser.add_argument("--system-prompt-file", default=config.get("LLM_SYSTEM_PROMPT_FILE") or "")
     args = parser.parse_args(argv)
+
+    # Log masked configuration (API key is masked)
+    sys.stderr.write("[llm] Using model: %s, base_url: %s\n" % (args.model, args.base_url))
+    masked_key = config.get_masked("LLM_API_KEY")
+    if masked_key:
+        sys.stderr.write("[llm] API key: %s\n" % masked_key)
 
     system_prompt = DEFAULT_SYSTEM_PROMPT
     requested_role = (args.role or role_default or DEFAULT_ROLE).strip()

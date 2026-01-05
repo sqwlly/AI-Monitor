@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Claude Monitor Search Tool
-搜索工具 - 代码和文档搜索
+Search tool - code and document search
 
-功能：
-1. 代码搜索（符号/引用/模式）
-2. 文档搜索（项目文档/在线/错误信息）
-3. 历史搜索（决策/错误/模式）
-4. 结果排序（相关性/时间/重要性）
+Features:
+1. Code search (symbols/references/patterns)
+2. Document search (project docs/online/error messages)
+3. History search (decisions/errors/patterns)
+4. Result sorting (relevance/time/importance)
 """
 
 import json
@@ -22,6 +22,10 @@ from typing import Any, Dict, List, Optional
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import core security modules
+from core.validators import RegexValidator
+from core.exceptions import ValidationError
 
 try:
     from tool_dispatcher import BaseTool, ToolSpec, ToolCategory, ToolPermission
@@ -216,7 +220,7 @@ class SearchTool(BaseTool):
         try:
             if file_path.stat().st_size > self.MAX_FILE_SIZE:
                 return False
-        except:
+        except (OSError, FileNotFoundError) as e:
             return False
 
         return True
@@ -236,6 +240,14 @@ class SearchTool(BaseTool):
         extensions = self._get_extensions(file_type)
 
         try:
+            # Validate regex for ReDoS protection
+            is_safe, error_msg = RegexValidator.validate(pattern)
+            if not is_safe:
+                return {
+                    "success": False,
+                    "error": f"Regex validation failed: {error_msg}"
+                }
+
             regex_flags = 0 if case_sensitive else re.IGNORECASE
             compiled = re.compile(pattern, regex_flags)
         except re.error as e:
@@ -327,7 +339,7 @@ class SearchTool(BaseTool):
                     "size": stat.st_size if file_path.is_file() else None,
                     "modified": stat.st_mtime,
                 })
-            except:
+            except OSError:
                 continue
 
         return {
@@ -433,7 +445,7 @@ class SearchTool(BaseTool):
                                 "type": "definition",
                             })
                             break
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 continue
 
         return {
