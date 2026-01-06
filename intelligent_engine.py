@@ -53,6 +53,8 @@ class PatternDetector:
         Args:
             window_size: Number of recent events to analyze
         """
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
         self.events: deque = deque(maxlen=window_size)
         self.loop_threshold = 3  # Number of repetitions to consider a loop
         self.similarity_threshold = 0.7  # Similarity threshold for repetition detection
@@ -111,11 +113,13 @@ class PatternDetector:
             # Extract first two words and ignore numbers/variables
             words = output.content.strip().split()
             if len(words) >= 2:
-                # Create pattern from first two words, removing digits
-                pattern = ' '.join(words[:2]).replace(str(words[1]) if words[1].isdigit() else words[1], '*')
+                # Create pattern from first two words, replacing digits with wildcard
+                first_word = words[0]
+                second_word = '*' if len(words) > 1 and words[1].isdigit() else (words[1] if len(words) > 1 else '')
+                pattern = f'{first_word} {second_word}'.strip()
                 patterns.append(pattern)
             else:
-                patterns.append(output.content[:20])
+                patterns.append(output.content[:20] if output.content else '')
 
         # Count pattern repetitions
         pattern_counts = {}
@@ -245,15 +249,17 @@ class PatternDetector:
 class ShortTermMemory:
     """Short-term memory system for tracking recent decisions and outcomes"""
 
-    def __init__(self, max_items: int = 50):
+    def __init__(self, max_items: int = 50, max_outcomes_per_decision: int = 10):
         """
         Initialize short-term memory
 
         Args:
             max_items: Maximum number of items to remember
+            max_outcomes_per_decision: Maximum outcomes to keep per decision
         """
         self.decisions: deque = deque(maxlen=max_items)
-        self.outcomes: Dict[str, List[Dict]] = {}  # decision_id -> outcomes
+        self.outcomes: Dict[str, deque] = {}  # decision_id -> outcomes (deque with maxlen)
+        self.max_outcomes_per_decision = max_outcomes_per_decision
         self.strategy_performance: Dict[str, Dict] = {}  # strategy -> stats
 
     def add_decision(self, decision_id: str, strategy: str, context: Dict) -> None:
@@ -277,7 +283,7 @@ class ShortTermMemory:
     def record_outcome(self, decision_id: str, success: bool, feedback: str = '') -> None:
         """Record the outcome of a decision"""
         if decision_id not in self.outcomes:
-            self.outcomes[decision_id] = []
+            self.outcomes[decision_id] = deque(maxlen=self.max_outcomes_per_decision)
 
         self.outcomes[decision_id].append({
             'timestamp': datetime.now().timestamp(),
@@ -285,11 +291,18 @@ class ShortTermMemory:
             'feedback': feedback
         })
 
-        # Update strategy performance
+        # Update strategy performance with defensive checks
         for decision in reversed(self.decisions):
-            if decision['id'] == decision_id:
-                strategy = decision['strategy']
-                if strategy in self.strategy_performance:
+            if decision.get('id') == decision_id:
+                strategy = decision.get('strategy')
+                if strategy:
+                    if strategy not in self.strategy_performance:
+                        # Initialize strategy stats if not exists
+                        self.strategy_performance[strategy] = {
+                            'used': 0,
+                            'success': 0,
+                            'failure': 0
+                        }
                     if success:
                         self.strategy_performance[strategy]['success'] += 1
                     else:
@@ -311,8 +324,10 @@ class ShortTermMemory:
         best_rate = 0.0
 
         for strategy, stats in self.strategy_performance.items():
-            if stats['used'] >= 2:  # Minimum usage threshold
-                rate = stats['success'] / stats['used']
+            used = stats.get('used', 0)
+            if used >= 2:  # Minimum usage threshold
+                success = stats.get('success', 0)
+                rate = success / used  # used >= 2 ensures no division by zero
                 if rate > best_rate:
                     best_rate = rate
                     best_strategy = strategy
@@ -477,7 +492,8 @@ class AdaptiveOptimizer:
             initial_aggressiveness: Starting aggressiveness level (0.0-1.0)
         """
         self.memory = memory
-        self.aggressiveness = initial_aggressiveness  # Current aggressiveness level (0.0-1.0)
+        # Clamp aggressiveness to [0.0, 1.0]
+        self.aggressiveness = max(0.0, min(1.0, initial_aggressiveness))
         self.adjustment_interval = 10  # Adjust after N outcomes
         self.outcome_count = 0
 

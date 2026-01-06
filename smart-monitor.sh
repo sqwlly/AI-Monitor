@@ -1395,19 +1395,27 @@ decide_response_llm() {
         intelligent_recommendation="$(python3 "${script_dir}/strategy_optimizer.py" intelligent --stage "${CURRENT_STAGE:-unknown}" 2>>"$LOG_FILE" || echo "")"
 
         if [ -n "$intelligent_recommendation" ]; then
-            local suggested_strategy
-            suggested_strategy="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('strategy', ''))" 2>/dev/null || echo "")"
+            # 验证 JSON 格式
+            if echo "$intelligent_recommendation" | python3 -m json.tool >/dev/null 2>&1; then
+                local suggested_strategy
+                suggested_strategy="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('strategy', ''))" 2>/dev/null || echo "")"
 
-            if [ -n "$suggested_strategy" ] && [ "$suggested_strategy" != "wait" ]; then
-                local confidence
-                confidence="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(str(d.get('confidence', 0)))" 2>/dev/null || echo "0")"
+                if [ -n "$suggested_strategy" ] && [ "$suggested_strategy" != "wait" ]; then
+                    local confidence
+                    confidence="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(str(d.get('confidence', 0)))" 2>/dev/null || echo "0")"
 
-                # 如果智能引擎置信度高且建议非等待策略，可以考虑直接使用
-                if python3 -c "exit(0 if float('$confidence') > 0.7 else 1)" 2>/dev/null; then
-                    log "🧠 智能引擎建议: $suggested_strategy (置信度: $confidence)"
-                    # 可以在这里添加特殊处理逻辑
-                    # 例如：对于 escalate 策略，可以发送特殊通知
+                    # 验证 confidence 是数字
+                    if [[ "$confidence" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                        # 如果智能引擎置信度高且建议非等待策略，记录日志
+                        if python3 -c "exit(0 if float('$confidence') > 0.7 else 1)" 2>/dev/null; then
+                            log "🧠 智能引擎建议: $suggested_strategy (置信度: $confidence)"
+                            # 可以在这里添加特殊处理逻辑
+                            # 例如：对于 escalate 策略，可以发送特殊通知
+                        fi
+                    fi
                 fi
+            else
+                log "⚠️  智能引擎返回无效 JSON，已跳过"
             fi
         fi
     fi

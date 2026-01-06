@@ -443,7 +443,7 @@ class StrategyOptimizer:
         confidence: float = 0.95
     ) -> Tuple[float, float]:
         """Calculate Wilson score confidence interval"""
-        if total == 0:
+        if total <= 0:
             return (0.0, 1.0)
 
         z = 1.96 if confidence == 0.95 else 1.645  # 95% or 90%
