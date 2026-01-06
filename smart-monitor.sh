@@ -35,6 +35,8 @@ LLM_MODEL=""
 LLM_TIMEOUT=""
 LLM_SYSTEM_PROMPT_FILE=""
 LLM_ROLE=""
+INTELLIGENCE_ENABLED="${AI_MONITOR_INTELLIGENCE_ENABLED:-0}"
+INTELLIGENT_ENGINE_AGGRESSIVENESS="${AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS:-0.5}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,8 +68,16 @@ while [ $# -gt 0 ]; do
             LLM_SYSTEM_PROMPT_FILE="${2:-}"
             shift 2
             ;;
+        --with-intelligence)
+            INTELLIGENCE_ENABLED=1
+            shift
+            ;;
+        --intelligence-aggressiveness)
+            INTELLIGENT_ENGINE_AGGRESSIVENESS="${2:-0.5}"
+            shift 2
+            ;;
         -h|--help)
-            echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>] [--role <role>] [--timeout <sec>] [--system-prompt-file <file>]"
+            echo "用法: ./smart-monitor.sh <会话:窗口.面板> [--model <model>] [--base-url <url>] [--api-key <key>] [--role <role>] [--timeout <sec>] [--system-prompt-file <file>] [--with-intelligence] [--intelligence-aggressiveness <0.0-1.0>]"
             exit 0
             ;;
         *)
@@ -1377,6 +1387,29 @@ decide_response_llm() {
     if should_force_wait_for_safety "$recent_output" "$idle_seconds"; then
         echo "WAIT"
         return
+    fi
+
+    # ========== 智能引擎快速分析（可选）==========
+    if [ "$INTELLIGENCE_ENABLED" = "1" ]; then
+        local intelligent_recommendation
+        intelligent_recommendation="$(python3 "${script_dir}/strategy_optimizer.py" intelligent --stage "${CURRENT_STAGE:-unknown}" 2>>"$LOG_FILE" || echo "")"
+
+        if [ -n "$intelligent_recommendation" ]; then
+            local suggested_strategy
+            suggested_strategy="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('strategy', ''))" 2>/dev/null || echo "")"
+
+            if [ -n "$suggested_strategy" ] && [ "$suggested_strategy" != "wait" ]; then
+                local confidence
+                confidence="$(echo "$intelligent_recommendation" | python3 -c "import sys, json; d=json.load(sys.stdin); print(str(d.get('confidence', 0)))" 2>/dev/null || echo "0")"
+
+                # 如果智能引擎置信度高且建议非等待策略，可以考虑直接使用
+                if python3 -c "exit(0 if float('$confidence') > 0.7 else 1)" 2>/dev/null; then
+                    log "🧠 智能引擎建议: $suggested_strategy (置信度: $confidence)"
+                    # 可以在这里添加特殊处理逻辑
+                    # 例如：对于 escalate 策略，可以发送特殊通知
+                fi
+            fi
+        fi
     fi
 
     local llm_script

@@ -337,9 +337,10 @@ LLM 监工参数（传给 run / 默认 target 调用）:
   --with-orchestrator      # 启用多Agent编排（默认 pipeline=vote）
   --with-arbiter           # 启用决策仲裁（多源建议冲突消解）
   --with-protocol          # 启用执行器协议握手/解析（Agent-of-Agent）
+  --with-intelligence      # 启用智能增强（模式检测+自适应策略）
   --agent                  # Agent-of-Agent：协议化 + 计划闭环（等价于 --with-protocol + 开启闭环）
   --pipeline <name>        # 选择 pipeline: default|vote|sequential|auto
-  --with-all               # 启用 memory+notify+assess+orchestrator+arbiter + protocol+闭环（推荐）
+  --with-all               # 启用 memory+notify+assess+orchestrator+arbiter+intelligence+protocol+闭环（推荐）
 
 交互模式默认：
   - 若未显式传上述扩展参数，则默认全量使能（可用 export AI_MONITOR_INTERACTIVE_DEFAULT_ALL=0 关闭）
@@ -697,6 +698,12 @@ start_llm_monitor() {
                     export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
                     idx=$((idx + 1))
                     ;;
+                --with-intelligence)
+                    has_feature_flags=1
+                    export AI_MONITOR_INTELLIGENCE_ENABLED=1
+                    export AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS="${AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS:-0.8}"
+                    idx=$((idx + 1))
+                    ;;
                 --pipeline)
                     has_feature_flags=1
                     if [ $((idx + 1)) -lt $args_count ]; then
@@ -714,6 +721,8 @@ start_llm_monitor() {
                     export AI_MONITOR_ARBITER_ENABLED=1
                     export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
                     export AI_MONITOR_AGENT_LOOP_ENABLED=1
+                    export AI_MONITOR_INTELLIGENCE_ENABLED=1
+                    export AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS="${AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS:-0.8}"
                     if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
                         export AI_MONITOR_PIPELINE="vote"
                     fi
@@ -740,6 +749,8 @@ start_llm_monitor() {
             export AI_MONITOR_ARBITER_ENABLED=1
             export AI_MONITOR_EXECUTOR_PROTOCOL_ENABLED=1
             export AI_MONITOR_AGENT_LOOP_ENABLED=1
+            export AI_MONITOR_INTELLIGENCE_ENABLED=1
+            export AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS="${AI_MONITOR_INTELLIGENT_ENGINE_AGGRESSIVENESS:-0.8}"
             if [ -z "${AI_MONITOR_PIPELINE:-}" ]; then
                 export AI_MONITOR_PIPELINE="vote"
             fi
@@ -796,6 +807,7 @@ start_llm_monitor() {
 	        [ "${AI_MONITOR_AGENT_LOOP_ENABLED:-0}" = "1" ] && features="${features}闭环 "
 	        [ "${AI_MONITOR_ORCHESTRATOR_ENABLED:-0}" = "1" ] && features="${features}多Agent(${AI_MONITOR_PIPELINE:-default}) "
 	        [ "${AI_MONITOR_ARBITER_ENABLED:-0}" = "1" ] && features="${features}仲裁 "
+	        [ "${AI_MONITOR_INTELLIGENCE_ENABLED:-0}" = "1" ] && features="${features}🧠智能 "
 	        if [ -n "$features" ]; then
 	            echo -e "  扩展: ${YELLOW}${features}${NC}"
 	        fi

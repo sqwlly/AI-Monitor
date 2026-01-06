@@ -40,6 +40,13 @@ DEFAULT_DB_DIR = Path.home() / ".tmux-monitor" / "memory"
 DEFAULT_DB_PATH = DEFAULT_DB_DIR / "monitor.db"
 DB_PATH = Path(os.environ.get("AI_MONITOR_MEMORY_DB", str(DEFAULT_DB_PATH)))
 
+# Import intelligent engine
+try:
+    from intelligent_engine import IntelligentEngine, Event
+    INTELLIGENT_ENGINE_AVAILABLE = True
+except ImportError:
+    INTELLIGENT_ENGINE_AVAILABLE = False
+
 
 class StrategyType(Enum):
     """Strategy type classification"""
@@ -964,6 +971,17 @@ def _parse_args():
     record_parser.add_argument("action", help="Action taken")
     record_parser.add_argument("outcome", choices=["success", "failure", "wait"], help="Outcome")
 
+    # intelligent command (智能引擎推荐)
+    intel_parser = subparsers.add_parser("intelligent", help="Get intelligent recommendation")
+    intel_parser.add_argument("--stage", default="unknown", help="Current stage")
+    intel_parser.add_argument("--events", help="Events JSON array")
+    intel_parser.add_argument("--window-size", type=int, default=20, help="Pattern detection window")
+    intel_parser.add_argument("--memory-size", type=int, default=50, help="Memory capacity")
+    intel_parser.add_argument("--aggressiveness", type=float, default=0.5, help="Initial aggressiveness (0.0-1.0)")
+
+    # intelligent-status command (智能引擎状态)
+    subparsers.add_parser("intelligent-status", help="Show intelligent engine status")
+
     return parser.parse_args()
 
 
@@ -1052,6 +1070,57 @@ def _cmd_record(optimizer, args):
     optimizer.record_usage(strategy_id, args.action, args.outcome)
 
 
+def _cmd_intelligent(optimizer, args):
+    """Handle intelligent command - use intelligent engine for recommendations"""
+    if not INTELLIGENT_ENGINE_AVAILABLE:
+        print(json.dumps({
+            "error": "Intelligent engine not available",
+            "message": "Install intelligent_engine.py to use this feature"
+        }, indent=2))
+        return
+
+    # Create or load intelligent engine
+    engine = IntelligentEngine(
+        pattern_window_size=getattr(args, 'window_size', 20),
+        memory_max_items=getattr(args, 'memory_size', 50),
+        initial_aggressiveness=getattr(args, 'aggressiveness', 0.5)
+    )
+
+    # Add events if provided
+    if hasattr(args, 'events') and args.events:
+        try:
+            events = json.loads(args.events)
+            for event_data in events:
+                engine.add_event(
+                    event_type=event_data.get('type', 'output'),
+                    content=event_data.get('content', ''),
+                    metadata=event_data.get('metadata', {})
+                )
+        except json.JSONDecodeError:
+            pass
+
+    # Get recommendation
+    stage = getattr(args, 'stage', 'unknown')
+    recommendation = engine.analyze_and_recommend(stage)
+
+    print(json.dumps(recommendation, indent=2))
+
+
+def _cmd_intelligent_status(optimizer, args):
+    """Handle intelligent-status command - show intelligent engine status"""
+    if not INTELLIGENT_ENGINE_AVAILABLE:
+        print(json.dumps({
+            "error": "Intelligent engine not available"
+        }, indent=2))
+        return
+
+    # Create engine and get status
+    engine = IntelligentEngine()
+    status = engine.get_status()
+
+    print(json.dumps(status, indent=2))
+
+
 def main():
     """Main entry point"""
     args = _parse_args()
@@ -1073,6 +1142,10 @@ def main():
         _cmd_suggest(optimizer, args)
     elif args.command == "record":
         _cmd_record(optimizer, args)
+    elif args.command == "intelligent":
+        _cmd_intelligent(optimizer, args)
+    elif args.command == "intelligent-status":
+        _cmd_intelligent_status(optimizer, args)
     else:
         _parse_args().parse_args(["--help"])
 
